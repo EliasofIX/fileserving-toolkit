@@ -47,6 +47,17 @@ buffer_size = 8388608
 large_threshold = 104857600
 # How long incomplete uploads are kept (seconds). 7 days.
 upload_ttl_secs = 604800
+# Hard cap per upload (bytes). Default 4 TiB.
+max_size = 4398046511104
+# Max simultaneous incomplete uploads (global ceiling).
+max_concurrent = 32
+# Max incomplete uploads per authenticated user.
+max_per_user = 8
+# After this many seconds without chunk activity, another user may supersede
+# an abandoned finalize (bytes fully received, complete never called).
+# Mid-transfer partials are never taken over by peers — only the owner or an
+# admin can replace them. Owners can always replace their own upload.
+idle_supersede_secs = 300
 
 [media]
 # Leave empty to disable. Optional ffmpeg/ffprobe for remux / incompatible codecs.

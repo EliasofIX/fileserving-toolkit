@@ -86,6 +86,18 @@ pub struct TransferConfig {
     pub large_threshold: u64,
     #[serde(default = "default_upload_ttl")]
     pub upload_ttl_secs: u64,
+    /// Hard cap on a single upload (bytes). Default 4 TiB.
+    #[serde(default = "default_max_size")]
+    pub max_size: u64,
+    /// Max simultaneous incomplete uploads.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Max incomplete uploads per user (encryption / logged-in). Default 8.
+    #[serde(default = "default_max_per_user")]
+    pub max_per_user: usize,
+    /// After idle, peers may supersede abandoned finalize only (offset == size).
+    #[serde(default = "default_idle_supersede")]
+    pub idle_supersede_secs: u64,
 }
 
 impl Default for TransferConfig {
@@ -94,6 +106,10 @@ impl Default for TransferConfig {
             buffer_size: default_buffer(),
             large_threshold: default_large(),
             upload_ttl_secs: default_upload_ttl(),
+            max_size: default_max_size(),
+            max_concurrent: default_max_concurrent(),
+            max_per_user: default_max_per_user(),
+            idle_supersede_secs: default_idle_supersede(),
         }
     }
 }
@@ -106,6 +122,18 @@ fn default_large() -> u64 {
 }
 fn default_upload_ttl() -> u64 {
     604_800
+}
+fn default_max_size() -> u64 {
+    4 * 1024 * 1024 * 1024 * 1024 // 4 TiB
+}
+fn default_max_concurrent() -> usize {
+    32
+}
+fn default_max_per_user() -> usize {
+    8
+}
+fn default_idle_supersede() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Deserialize)]

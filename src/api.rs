@@ -285,20 +285,26 @@ async fn api_upload_status(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = require_auth(&headers, &st.auth) {
-        return r;
-    }
-    match st.transfers.status(&id) {
-        Some(u) => Json(serde_json::json!({
+    let sess = match require_auth(&headers, &st.auth) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.transfers.status(&id, sess.as_ref()) {
+        Ok(u) => Json(serde_json::json!({
             "id": u.id,
             "path": u.virtual_path,
             "size": u.size,
             "offset": u.offset,
         }))
         .into_response(),
-        None => (
+        Err(e) if e.contains("unknown") => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"not found"})),
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": e})),
         )
             .into_response(),
     }
@@ -310,9 +316,10 @@ async fn api_upload_put(
     Path(id): Path<String>,
     request: Request,
 ) -> Response {
-    if let Err(r) = require_auth(&headers, &st.auth) {
-        return r;
-    }
+    let sess = match require_auth(&headers, &st.auth) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let offset: u64 = headers
         .get("x-fst-offset")
         .and_then(|v| v.to_str().ok())
@@ -320,7 +327,6 @@ async fn api_upload_put(
         .unwrap_or(0);
 
     let body = request.into_body();
-    // Cap a single request body at 64 MiB — clients chunk large uploads.
     const MAX_CHUNK: usize = 64 * 1024 * 1024;
     let bytes = match axum::body::to_bytes(body, MAX_CHUNK).await {
         Ok(b) => b,
@@ -333,7 +339,10 @@ async fn api_upload_put(
         }
     };
 
-    match st.transfers.write_chunk(&id, offset, &bytes[..]) {
+    match st
+        .transfers
+        .write_chunk(&id, offset, &bytes[..], sess.as_ref())
+    {
         Ok(u) => Json(serde_json::json!({
             "id": u.id,
             "offset": u.offset,
@@ -438,7 +447,7 @@ fn serve_file_range(
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
     let total = meta.len();
-    let (status, start, end) = match parse_range(range, total) {
+    let (status, start, end, take) = match parse_range(range, total) {
         Ok(v) => v,
         Err(()) => {
             let mut res = Response::new(Body::empty());
@@ -450,7 +459,6 @@ fn serve_file_range(
             return res;
         }
     };
-    let take = end - start + 1;
 
     let path2 = path.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
@@ -544,42 +552,45 @@ fn serve_encrypted(
         .plain_size
         .or_else(|| crypto::read_plain_size_meta(path))
         .unwrap_or(0);
-    let (status, start, end) = match parse_range(range, total) {
+    let (status, start, end, take) = match parse_range(range, total) {
         Ok(v) => v,
         Err(()) => {
             return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
         }
     };
-    let take = end - start + 1;
 
     let path = path.to_path_buf();
     let dk = dk.to_vec();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
-    std::thread::spawn(move || {
-        let mut reader = match crypto::EncryptedReader::open(&path, &dk) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
-                return;
+    if take > 0 {
+        std::thread::spawn(move || {
+            let mut reader = match crypto::EncryptedReader::open(&path, &dk) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+                    return;
+                }
+            };
+            let mut pos = start;
+            while pos <= end {
+                let window_end = (pos + crypto::CHUNK_PLAIN).min(end + 1);
+                let mut out = Vec::new();
+                if let Err(e) = reader.read_plain_range(pos, window_end, &mut out) {
+                    let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+                    return;
+                }
+                if out.is_empty() {
+                    break;
+                }
+                pos += out.len() as u64;
+                if tx.blocking_send(Ok(Bytes::from(out))).is_err() {
+                    break;
+                }
             }
-        };
-        let mut pos = start;
-        while pos <= end {
-            let window_end = (pos + crypto::CHUNK_PLAIN).min(end + 1);
-            let mut out = Vec::new();
-            if let Err(e) = reader.read_plain_range(pos, window_end, &mut out) {
-                let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
-                return;
-            }
-            if out.is_empty() {
-                break;
-            }
-            pos += out.len() as u64;
-            if tx.blocking_send(Ok(Bytes::from(out))).is_err() {
-                break;
-            }
-        }
-    });
+        });
+    } else {
+        drop(tx);
+    }
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = Body::from_stream(stream);
@@ -607,15 +618,16 @@ fn serve_encrypted(
     res
 }
 
-fn parse_range(range: Option<&str>, total: u64) -> Result<(StatusCode, u64, u64), ()> {
+fn parse_range(range: Option<&str>, total: u64) -> Result<(StatusCode, u64, u64, u64), ()> {
+    // Returns (status, start, end_inclusive, content_length)
     if total == 0 {
-        return Ok((StatusCode::OK, 0, 0));
+        return Ok((StatusCode::OK, 0, 0, 0));
     }
     let Some(r) = range else {
-        return Ok((StatusCode::OK, 0, total - 1));
+        return Ok((StatusCode::OK, 0, total - 1, total));
     };
     let Some(spec) = r.strip_prefix("bytes=") else {
-        return Ok((StatusCode::OK, 0, total - 1));
+        return Ok((StatusCode::OK, 0, total - 1, total));
     };
     let (start_s, end_s) = spec.split_once('-').unwrap_or((spec, ""));
     let start: u64 = start_s.parse().unwrap_or(0);
@@ -627,7 +639,7 @@ fn parse_range(range: Option<&str>, total: u64) -> Result<(StatusCode, u64, u64)
     if start > end || start >= total {
         return Err(());
     }
-    Ok((StatusCode::PARTIAL_CONTENT, start, end))
+    Ok((StatusCode::PARTIAL_CONTENT, start, end, end - start + 1))
 }
 
 async fn api_stream(

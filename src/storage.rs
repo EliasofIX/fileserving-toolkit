@@ -1,4 +1,5 @@
 //! Path resolution: shared root + per-user roots, traversal-safe.
+//! Rejects `..`, absolute escapes, and symlink components under the root.
 
 use crate::auth::{Role, Session};
 use crate::config::Config;
@@ -34,7 +35,6 @@ impl Storage {
     /// Virtual forms:
     ///   shared/...     → shared_root/...
     ///   ~user/...      → users_root/user/...
-    ///   (empty / ".")  → listing roots depends on session
     pub fn resolve(
         &self,
         virtual_path: &str,
@@ -48,16 +48,16 @@ impl Storage {
         let (root, rest) = if let Some(rest) = vp.strip_prefix("shared/") {
             (self.shared.clone(), rest)
         } else if vp == "shared" {
-            return Ok(self.shared.clone());
+            let root = ensure_canonical_dir(&self.shared)?;
+            return Ok(root);
         } else if let Some(rest) = vp.strip_prefix('~') {
             let (user, rem) = match rest.split_once('/') {
                 Some((u, r)) => (u, r),
                 None => (rest, ""),
             };
-            if user.is_empty() {
+            if user.is_empty() || user.contains("..") || user.contains('/') {
                 return Err("bad user path".into());
             }
-            // Authorization
             if self.encryption {
                 let sess = session.ok_or("unauthorized")?;
                 if sess.role != Role::Admin && sess.username != user {
@@ -66,7 +66,7 @@ impl Storage {
             }
             let root = self.users.join(user);
             if rem.is_empty() {
-                return Ok(root);
+                return ensure_canonical_dir(&root);
             }
             (root, rem)
         } else {
@@ -74,14 +74,7 @@ impl Storage {
         };
 
         let safe = sanitize_rel(rest)?;
-        let full = root.join(&safe);
-        // Ensure still under root
-        let full_c = full.canonicalize().unwrap_or(full.clone());
-        let root_c = root.canonicalize().unwrap_or(root.clone());
-        if !full_c.starts_with(&root_c) && full.exists() {
-            return Err("path escape denied".into());
-        }
-        Ok(full)
+        resolve_under_root(&root, &safe)
     }
 
     pub fn list(
@@ -91,7 +84,6 @@ impl Storage {
     ) -> Result<Vec<DirEntry>, String> {
         let vp = virtual_path.trim().trim_start_matches('/');
 
-        // Top-level virtual roots
         if vp.is_empty() || vp == "." {
             return self.list_roots(session);
         }
@@ -105,13 +97,20 @@ impl Storage {
         let rd = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
         for ent in rd.flatten() {
             let name = ent.file_name().to_string_lossy().to_string();
-            // Hide internal sidecars
             if name.ends_with(".fst-meta")
                 || name.ends_with(".fst-idx")
                 || name.ends_with(".sk")
                 || name.ends_with(".ek")
                 || name.ends_with(".part")
                 || name.starts_with('.')
+            {
+                continue;
+            }
+            // Skip symlink entries in listings
+            if ent
+                .file_type()
+                .map(|t| t.is_symlink())
+                .unwrap_or(false)
             {
                 continue;
             }
@@ -172,7 +171,9 @@ impl Storage {
             if s.role == Role::Admin {
                 if let Ok(rd) = std::fs::read_dir(&self.users) {
                     for ent in rd.flatten() {
-                        if ent.path().is_dir() {
+                        if ent.path().is_dir()
+                            && !ent.file_type().map(|t| t.is_symlink()).unwrap_or(true)
+                        {
                             let name = ent.file_name().to_string_lossy().to_string();
                             out.push(DirEntry {
                                 name: format!("~{name}"),
@@ -196,10 +197,11 @@ impl Storage {
                 });
             }
         } else if !self.encryption {
-            // No auth: expose shared + all user dirs
             if let Ok(rd) = std::fs::read_dir(&self.users) {
                 for ent in rd.flatten() {
-                    if ent.path().is_dir() {
+                    if ent.path().is_dir()
+                        && !ent.file_type().map(|t| t.is_symlink()).unwrap_or(true)
+                    {
                         let name = ent.file_name().to_string_lossy().to_string();
                         out.push(DirEntry {
                             name: format!("~{name}"),
@@ -223,21 +225,96 @@ impl Storage {
 
     pub fn delete(&self, virtual_path: &str, session: Option<&Session>) -> Result<(), String> {
         let p = self.resolve(virtual_path, session)?;
-        if p.is_dir() {
+        let meta = std::fs::symlink_metadata(&p).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() {
+            return Err("symlink denied".into());
+        }
+        if meta.is_dir() {
             std::fs::remove_dir_all(&p).map_err(|e| e.to_string())?;
         } else {
             std::fs::remove_file(&p).map_err(|e| e.to_string())?;
             let _ = std::fs::remove_file(format!("{}.fst-meta", p.display()));
+            let _ = std::fs::remove_file(format!("{}.fst-idx", p.display()));
         }
         Ok(())
     }
+}
+
+fn ensure_canonical_dir(root: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let meta = std::fs::symlink_metadata(root).map_err(|e| e.to_string())?;
+    if meta.file_type().is_symlink() {
+        return Err("root must not be a symlink".into());
+    }
+    root.canonicalize().map_err(|e| e.to_string())
+}
+
+/// Walk `rel` under `root`, rejecting symlink components. Works for not-yet-created leaves.
+fn resolve_under_root(root: &Path, rel: &Path) -> Result<PathBuf, String> {
+    let root_c = ensure_canonical_dir(root)?;
+    let comps: Vec<_> = rel.components().collect();
+    if comps.is_empty() {
+        return Ok(root_c);
+    }
+
+    let mut cur = root_c.clone();
+    for (i, comp) in comps.iter().enumerate() {
+        let Component::Normal(name) = comp else {
+            return Err("illegal path component".into());
+        };
+        let next = cur.join(name);
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err("symlink denied".into());
+                }
+                if i + 1 == comps.len() {
+                    // Final existing component — canonicalize and contain.
+                    let c = next.canonicalize().map_err(|e| e.to_string())?;
+                    if !c.starts_with(&root_c) {
+                        return Err("path escape denied".into());
+                    }
+                    return Ok(c);
+                }
+                if !meta.is_dir() {
+                    return Err("not a directory".into());
+                }
+                cur = next.canonicalize().map_err(|e| e.to_string())?;
+                if !cur.starts_with(&root_c) {
+                    return Err("path escape denied".into());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Parent `cur` is canonical and under root; append remaining names lexically.
+                if !cur.starts_with(&root_c) {
+                    return Err("path escape denied".into());
+                }
+                let mut out = cur;
+                for c in &comps[i..] {
+                    let Component::Normal(n) = c else {
+                        return Err("illegal path component".into());
+                    };
+                    out.push(n);
+                }
+                return Ok(out);
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(cur)
 }
 
 fn sanitize_rel(rel: &str) -> Result<PathBuf, String> {
     let mut out = PathBuf::new();
     for c in Path::new(rel).components() {
         match c {
-            Component::Normal(s) => out.push(s),
+            Component::Normal(s) => {
+                let s = s.to_string_lossy();
+                if s.is_empty() || s == "." || s == ".." {
+                    return Err("illegal path component".into());
+                }
+                out.push(s.as_ref());
+            }
             Component::CurDir => {}
             _ => return Err("illegal path component".into()),
         }
@@ -261,5 +338,43 @@ pub fn classify(name: &str) -> String {
             "audio".into()
         }
         _ => "file".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn rejects_dotdot() {
+        assert!(sanitize_rel("a/../b").is_err());
+    }
+
+    #[test]
+    fn contains_new_leaf() {
+        let dir = tempfile_dir();
+        let p = resolve_under_root(&dir, Path::new("newfile.txt")).unwrap();
+        assert!(p.starts_with(dir.canonicalize().unwrap()));
+        assert!(p.ends_with("newfile.txt"));
+    }
+
+    #[test]
+    fn rejects_symlink_component() {
+        let dir = tempfile_dir();
+        let outside = tempfile_dir();
+        let link = dir.join("escape");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let err = resolve_under_root(&dir, Path::new("escape/x")).unwrap_err();
+            assert!(err.contains("symlink"));
+        }
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("fst-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&p).unwrap();
+        p
     }
 }

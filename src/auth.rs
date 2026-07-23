@@ -139,6 +139,7 @@ impl AuthState {
     }
 
     /// Pick the DK used to decrypt a virtual path.
+    /// ~user files are dual-wrapped to the shared EK; admins decrypt via shared secrets.
     pub fn dek_for_path(
         &self,
         virtual_path: &str,
@@ -153,6 +154,11 @@ impl AuthState {
             let user = rest.split('/').next().unwrap_or("");
             if user == session.username {
                 return Ok(session.secrets.clone());
+            }
+            if session.role == Role::Admin {
+                return self
+                    .shared_secrets()
+                    .ok_or_else(|| "shared keystore locked — set FST_SHARED_PASSWORD".into());
             }
             return Err("forbidden: cannot decrypt another user's files".into());
         }

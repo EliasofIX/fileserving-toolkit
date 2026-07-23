@@ -43,8 +43,7 @@ enum Commands {
     Serve,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "fst=info".into()))
         .with_target(false)
@@ -75,6 +74,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cli.config.display()
         )
     })?;
+
+    let workers = if cfg.server.workers == 0 {
+        2
+    } else {
+        cfg.server.workers
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    rt.block_on(serve(cfg, workers))
+}
+
+async fn serve(
+    cfg: Config,
+    workers: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     cfg.ensure_dirs()?;
 
     if cfg.encryption.enabled {
@@ -88,17 +105,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    let workers = if cfg.server.workers == 0 {
-        2
-    } else {
-        cfg.server.workers
-    };
-
     let storage = Arc::new(Storage::new(&cfg));
     let auth = Arc::new(AuthState::new(&cfg));
 
     if cfg.encryption.enabled {
-        // Unlock shared keystore (used for shared/* at-rest encryption).
         match std::env::var("FST_SHARED_PASSWORD") {
             Ok(pw) if !pw.is_empty() => {
                 let ks = auth.keystore_path().clone();
@@ -134,7 +144,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         media,
     };
 
-    // Background GC — rare wakeups, idle-friendly
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
@@ -157,7 +166,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    // Limit concurrent connections softly via tower — keep default; low idle cost.
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
