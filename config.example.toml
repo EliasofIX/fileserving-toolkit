@@ -1,0 +1,56 @@
+# fileserving-toolkit (FST) configuration
+# Copy to config.toml and adjust.
+
+[server]
+bind = "0.0.0.0:8080"
+# Worker threads (0 = tokio default). Prefer 2–4 on small VPS.
+workers = 2
+# Idle-friendly: disable keep-alive spam if behind a reverse proxy that pools.
+data_dir = "./data"
+
+[paths]
+# Shared library visible to every authenticated user (or everyone if encryption off).
+shared_root = "./data/shared"
+# Per-user homes live under: {users_root}/{username}/
+users_root = "./data/users"
+# Resumable upload state (offsets, temp parts). Safe to delete idle sessions.
+upload_state_dir = "./data/uploads"
+
+[encryption]
+# true  → at-rest PQ hybrid encryption, login required, TLS strongly recommended
+# false → plaintext on disk, no login, plain HTTP
+enabled = false
+
+[auth]
+# Used only when encryption.enabled = true.
+# Generate password hashes with:  fst hash-password 'your-password'
+# role: "admin" | "user"
+# admin sees shared + all user roots; user sees shared + own root.
+[[auth.users]]
+username = "admin"
+password_hash = ""   # fill via `fst hash-password`
+role = "admin"
+
+# [[auth.users]]
+# username = "alice"
+# password_hash = ""
+# role = "user"
+
+[session]
+# Session lifetime in seconds (default 7 days)
+ttl_secs = 604800
+
+[transfer]
+# Read/write buffer size for streaming (bytes). 8 MiB is a good default.
+buffer_size = 8388608
+# UI shows Transfer Dial above this size (bytes). 100 MiB.
+large_threshold = 104857600
+# How long incomplete uploads are kept (seconds). 7 days.
+upload_ttl_secs = 604800
+
+[media]
+# Leave empty to disable. Optional ffmpeg/ffprobe for remux / incompatible codecs.
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+# Transcode cache for converted streams (optional). Empty = /tmp/fst-media
+cache_dir = "./data/media-cache"

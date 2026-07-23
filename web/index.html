@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FST</title>
+  <link rel="stylesheet" href="/css/fst.css" />
+  <link rel="icon" href="data:," />
+</head>
+<body>
+  <div id="app">
+    <aside class="rail" id="rail">
+      <a class="brand" href="#" data-nav="browse">FST</a>
+      <nav>
+        <a href="#" data-nav="browse" class="active">Browse</a>
+        <a href="#" data-nav="photos">Photos</a>
+        <a href="#" data-nav="video">Video</a>
+        <a href="#" data-nav="music">Music</a>
+      </nav>
+      <div class="rail-foot">
+        <button type="button" id="theme-toggle" title="Theme">Aa</button>
+        <button type="button" id="logout-btn" class="hidden">Out</button>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header class="top">
+        <div class="crumbs" id="crumbs"></div>
+        <div class="actions">
+          <label class="act">
+            Upload
+            <input type="file" id="file-input" multiple hidden />
+          </label>
+          <button type="button" class="act" id="mkdir-btn">New folder</button>
+        </div>
+      </header>
+      <section id="view" class="view-browse"></section>
+    </main>
+  </div>
+
+  <!-- Login -->
+  <div id="login" class="overlay hidden">
+    <form id="login-form" class="login-card">
+      <h1>FST</h1>
+      <p class="sub">Sign in</p>
+      <input name="username" autocomplete="username" placeholder="Username" required />
+      <input name="password" type="password" autocomplete="current-password" placeholder="Password" required />
+      <button type="submit">Enter</button>
+      <p class="err" id="login-err"></p>
+    </form>
+  </div>
+
+  <!-- Photo lightbox -->
+  <div id="photo-stage" class="overlay stage hidden" tabindex="0">
+    <button type="button" class="stage-close" data-close>Close</button>
+    <img id="photo-img" alt="" />
+    <p id="photo-caption"></p>
+  </div>
+
+  <!-- Video theater -->
+  <div id="video-stage" class="overlay stage theater hidden" tabindex="0">
+    <button type="button" class="stage-close" data-close>Close</button>
+    <div class="theater-frame">
+      <video id="video-el" playsinline></video>
+      <div class="theater-ui">
+        <button type="button" id="video-play" class="play-glyph" aria-label="Play">▶</button>
+        <div class="scrub">
+          <input type="range" id="video-scrub" min="0" max="1000" value="0" />
+        </div>
+        <p id="video-title"></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Music -->
+  <div id="music-stage" class="overlay stage music hidden" tabindex="0">
+    <button type="button" class="stage-close" data-close>Close</button>
+    <div class="music-panel">
+      <p class="music-label">Now playing</p>
+      <h2 id="music-title"></h2>
+      <p id="music-meta"></p>
+      <audio id="audio-el"></audio>
+      <div class="music-controls">
+        <button type="button" id="music-play">Play</button>
+        <input type="range" id="music-scrub" min="0" max="1000" value="0" />
+        <span id="music-time"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Transfer Dial -->
+  <div id="transfer-dial" class="overlay dial hidden" aria-live="polite">
+    <div class="dial-face">
+      <p class="dial-label" id="dial-label">Transfer</p>
+      <p class="dial-pct" id="dial-pct">0%</p>
+      <p class="dial-detail" id="dial-detail"></p>
+      <div class="dial-bar"><div id="dial-fill"></div></div>
+    </div>
+  </div>
+
+  <script src="/js/fst.js"></script>
+</body>
+</html>

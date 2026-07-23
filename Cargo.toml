@@ -1,0 +1,55 @@
+[package]
+name = "fst"
+version = "0.1.0"
+edition = "2021"
+description = "fileserving-toolkit — suckless file server with Archive Light UI"
+license = "PolyForm-Noncommercial-1.0.0"
+authors = ["ÆLĪĀŠ"]
+
+[dependencies]
+# async runtime — single-threaded friendly defaults via config
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "process", "signal"] }
+axum = { version = "0.8", features = ["multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-gzip"] }
+tokio-stream = "0.1"
+
+# serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# crypto — PQ + PQ-safe symmetric
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+sha2 = "0.10"
+hkdf = "0.12"
+hex = "0.4"
+base64 = "0.22"
+ml-kem = { version = "0.2", features = ["deterministic"] }
+zeroize = { version = "1", features = ["derive"] }
+
+# auth sessions
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+
+# misc
+chrono = { version = "0.4", features = ["serde"] }
+mime_guess = "2"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
+clap = { version = "4", features = ["derive"] }
+subtle = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
