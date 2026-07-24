@@ -210,10 +210,17 @@
         alert("An upload is already in progress.");
         return;
       }
+      uploading = true;
+      setUploadControlsDisabled(true);
       try {
         const files = await collectDroppedFiles(e.dataTransfer);
+        // Temporarily release so uploadFiles can take the lock for the transfer itself.
+        uploading = false;
+        setUploadControlsDisabled(false);
         await uploadFiles(files);
       } catch (err) {
+        uploading = false;
+        setUploadControlsDisabled(false);
         alert(err.message);
       }
       await refresh();
@@ -567,7 +574,8 @@
     $("#dial-label").textContent = label;
     return dialToken;
   }
-  function updateDial(done, total, detail) {
+  function updateDial(done, total, detail, token) {
+    if (token !== undefined && token !== dialToken) return;
     const pct = total ? Math.min(100, (done / total) * 100) : 0;
     $("#dial-pct").textContent = `${pct < 10 ? pct.toFixed(1) : Math.floor(pct)}%`;
     $("#dial-fill").style.width = `${pct}%`;
@@ -667,7 +675,7 @@
         token = showDial(
           prepared.length > 1 ? `Upload · ${prepared.length} files` : "Upload"
         );
-        updateDial(0, totalBytes, prepared[0].rel);
+        updateDial(0, totalBytes, prepared[0].rel, token);
       }
 
       for (const item of prepared) {
@@ -675,13 +683,14 @@
           await uploadFile(item, {
             base,
             manageDial: !batch,
+            dialToken: token,
             onProgress: (offset) => {
-              if (batch) updateDial(doneBytes + offset, totalBytes, item.rel);
+              if (batch) updateDial(doneBytes + offset, totalBytes, item.rel, token);
             },
           });
           doneBytes += item.file.size;
           okCount += 1;
-          if (batch) updateDial(doneBytes, totalBytes, item.rel);
+          if (batch) updateDial(doneBytes, totalBytes, item.rel, token);
         } catch (err) {
           failures.push(`${item.rel}: ${err.message}`);
         }
@@ -694,7 +703,7 @@
           failures.length === 0
             ? "Done"
             : `Uploaded ${okCount}/${prepared.length}`;
-        updateDial(doneBytes, totalBytes, summary);
+        updateDial(doneBytes, totalBytes, summary, token);
         scheduleHideDial(token);
       }
     }
@@ -728,7 +737,7 @@
     const base = opts.base || state.path || "shared";
     const dest = `${base.replace(/\/$/, "")}/${rel}`;
     const large = file.size >= (state.status?.large_threshold || 100 * 1024 * 1024);
-    let token = 0;
+    let token = opts.dialToken || 0;
     if (manageDial && large) token = showDial("Upload");
 
     const init = await api("/api/upload/init", {
@@ -751,16 +760,16 @@
       if (!res.ok) throw new Error(data.error || "upload failed");
       offset = data.offset;
       onProgress(offset);
-      if (manageDial && large) updateDial(offset, file.size, rel);
+      if (manageDial && large) updateDial(offset, file.size, rel, token);
     }
 
     if (manageDial && large) {
       $("#dial-label").textContent = "Sealing";
-      updateDial(file.size, file.size, rel);
+      updateDial(file.size, file.size, rel, token);
     }
     await api(`/api/upload/${id}/complete`, { method: "POST" });
     if (manageDial && large) {
-      updateDial(file.size, file.size, "Done");
+      updateDial(file.size, file.size, "Done", token);
       scheduleHideDial(token);
     }
   }
@@ -793,7 +802,7 @@
           if (d) break;
           await writable.write(value);
           done += value.length;
-          updateDial(done, len || done, name);
+          updateDial(done, len || done, name, token);
         }
         await writable.close();
         scheduleHideDial(token);
@@ -808,7 +817,7 @@
     }
 
     // Fallback: browser download manager (no RAM blowup)
-    updateDial(0, total, "Handing off to browser…");
+    updateDial(0, total, "Handing off to browser…", token);
     const a = document.createElement("a");
     a.href = fileUrl(path);
     a.download = name;
