@@ -58,6 +58,8 @@ Downloads use HTTP `Range`. State survives process restart under `upload_state_d
 
 Large transfers open the **Transfer Dial** UI.
 
+The browse UI can upload whole folders (picker or drag-and-drop). Nested paths are preserved under the current directory; parent folders are created automatically. Empty folders and zero-byte files are skipped. Unsafe path segments (`..`, control/`<>\"` characters) and reserved sidecar suffixes (`.fst-meta`, `.fst-idx`, `.sk`, `.ek`, `.part`) are rejected. Folder uploads are capped (depth/file count) and run one batch at a time.
+
 ## Media
 
 Optional `ffmpeg` / `ffprobe` for remux when the browser cannot play a container/codec natively. Leave paths empty / missing binaries to disable — zero cost when idle.

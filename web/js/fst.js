@@ -12,6 +12,15 @@
   };
 
   const CHUNK = 8 * 1024 * 1024; // 8 MiB upload chunks
+  const MAX_UPLOAD_FILES = 5000;
+  const MAX_UPLOAD_DEPTH = 32;
+  const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024 * 1024; // 4 TiB total (matches server max_size ceiling)
+  const RESERVED_SUFFIXES = [".fst-meta", ".fst-idx", ".sk", ".ek", ".part"];
+
+  let chromeBound = false;
+  let uploading = false;
+  let dialToken = 0;
+  let dialHideTimer = 0;
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -122,6 +131,8 @@
   }
 
   function bindChrome() {
+    if (chromeBound) return;
+    chromeBound = true;
     $$("[data-nav]").forEach((a) => {
       a.onclick = (e) => {
         e.preventDefault();
@@ -145,15 +156,119 @@
     $("#file-input").onchange = async (e) => {
       const files = [...e.target.files];
       e.target.value = "";
-      for (const f of files) await uploadFile(f);
-      await refresh();
+      await handleIncomingFiles(files);
     };
+    $("#folder-input").onchange = async (e) => {
+      const files = [...e.target.files];
+      e.target.value = "";
+      await handleIncomingFiles(files);
+    };
+    bindDropTarget();
     $$("[data-close]").forEach((b) => {
       b.onclick = () => closeStages();
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") closeStages();
     });
+  }
+
+  async function handleIncomingFiles(files) {
+    try {
+      await uploadFiles(files);
+    } catch (err) {
+      alert(err.message);
+    }
+    await refresh();
+  }
+
+  function clearDropTarget(main) {
+    main.classList.remove("drop-target");
+  }
+
+  function bindDropTarget() {
+    const main = $("#main");
+    const onDragOver = (e) => {
+      if (![...e.dataTransfer.types].includes("Files")) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = uploading ? "none" : "copy";
+    };
+    main.addEventListener("dragenter", (e) => {
+      if (![...e.dataTransfer.types].includes("Files")) return;
+      e.preventDefault();
+      if (!uploading) main.classList.add("drop-target");
+    });
+    main.addEventListener("dragleave", (e) => {
+      // Ignore crossings into children; only clear when leaving #main entirely.
+      if (e.relatedTarget && main.contains(e.relatedTarget)) return;
+      clearDropTarget(main);
+    });
+    main.addEventListener("dragover", onDragOver);
+    main.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      clearDropTarget(main);
+      if (uploading) {
+        alert("An upload is already in progress.");
+        return;
+      }
+      uploading = true;
+      setUploadControlsDisabled(true);
+      try {
+        const files = await collectDroppedFiles(e.dataTransfer);
+        // Temporarily release so uploadFiles can take the lock for the transfer itself.
+        uploading = false;
+        setUploadControlsDisabled(false);
+        await uploadFiles(files);
+      } catch (err) {
+        uploading = false;
+        setUploadControlsDisabled(false);
+        alert(err.message);
+      }
+      await refresh();
+    });
+    document.addEventListener("dragend", () => clearDropTarget(main));
+  }
+
+  /** Collect files from a drop, preserving folder relative paths when possible. */
+  async function collectDroppedFiles(dt) {
+    const items = [...(dt.items || [])];
+    if (items.length && items.some((it) => typeof it.webkitGetAsEntry === "function")) {
+      const files = [];
+      const entries = items
+        .filter((it) => it.kind === "file")
+        .map((it) => it.webkitGetAsEntry())
+        .filter(Boolean);
+      for (const entry of entries) {
+        await walkEntry(entry, "", files, 0);
+      }
+      if (files.length) return files;
+    }
+    return [...(dt.files || [])].map((file) => ({ file, rel: file.webkitRelativePath || file.name }));
+  }
+
+  async function walkEntry(entry, prefix, out, depth) {
+    if (depth >= MAX_UPLOAD_DEPTH) {
+      throw new Error(`Folder is too deep (max ${MAX_UPLOAD_DEPTH} levels).`);
+    }
+    if (out.length >= MAX_UPLOAD_FILES) {
+      throw new Error(`Too many files to upload at once (max ${MAX_UPLOAD_FILES}).`);
+    }
+    if (entry.isFile) {
+      const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+      const rel = prefix ? `${prefix}${file.name}` : file.name;
+      out.push({ file, rel });
+      return;
+    }
+    if (!entry.isDirectory) return;
+    const dirPrefix = `${prefix}${entry.name}/`;
+    const reader = entry.createReader();
+    // readEntries may return partial batches; keep reading until empty.
+    for (;;) {
+      const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+      if (!batch.length) break;
+      for (const child of batch) {
+        await walkEntry(child, dirPrefix, out, depth + 1);
+      }
+    }
   }
 
   function closeStages() {
@@ -186,23 +301,30 @@
 
   function renderCrumbs() {
     const el = $("#crumbs");
+    el.replaceChildren();
     const parts = (state.path || "").split("/").filter(Boolean);
-    let acc = "";
-    const bits = [
-      `<a href="#" data-p="">Library</a>`,
-      ...parts.map((p) => {
-        acc = acc ? `${acc}/${p}` : p;
-        const here = acc;
-        return `<span>/</span><a href="#" data-p="${here}">${escapeHtml(p)}</a>`;
-      }),
-    ];
-    el.innerHTML = bits.join(" ");
-    $$("[data-p]", el).forEach((a) => {
+
+    const addCrumb = (label, path) => {
+      const a = document.createElement("a");
+      a.href = "#";
+      a.textContent = label;
+      a.dataset.p = path;
       a.onclick = (e) => {
         e.preventDefault();
         navigate(state.nav, a.dataset.p);
       };
-    });
+      el.appendChild(a);
+    };
+
+    addCrumb("Library", "");
+    let acc = "";
+    for (const p of parts) {
+      const sep = document.createElement("span");
+      sep.textContent = " / ";
+      el.appendChild(sep);
+      acc = acc ? `${acc}/${p}` : p;
+      addCrumb(p, acc);
+    }
   }
 
   function escapeHtml(s) {
@@ -215,7 +337,7 @@
     const view = $("#view");
     view.className = "view-browse";
     if (!state.entries.length) {
-      view.innerHTML = `<p class="empty">Nothing here. Upload a file or open a folder.</p>`;
+      view.innerHTML = `<p class="empty">Nothing here. Upload files or a folder, or open a path.</p>`;
       return;
     }
     const ul = document.createElement("ul");
@@ -443,24 +565,180 @@
 
   /* Transfer Dial */
   function showDial(label) {
+    if (dialHideTimer) {
+      clearTimeout(dialHideTimer);
+      dialHideTimer = 0;
+    }
+    dialToken += 1;
     $("#transfer-dial").classList.remove("hidden");
     $("#dial-label").textContent = label;
+    return dialToken;
   }
-  function updateDial(done, total, detail) {
+  function updateDial(done, total, detail, token) {
+    if (token !== undefined && token !== dialToken) return;
     const pct = total ? Math.min(100, (done / total) * 100) : 0;
     $("#dial-pct").textContent = `${pct < 10 ? pct.toFixed(1) : Math.floor(pct)}%`;
     $("#dial-fill").style.width = `${pct}%`;
     $("#dial-detail").textContent = detail || `${fmtSize(done)} / ${fmtSize(total)}`;
   }
-  function hideDial() {
+  function hideDial(token) {
+    if (token !== undefined && token !== dialToken) return;
     $("#transfer-dial").classList.add("hidden");
   }
+  function scheduleHideDial(token) {
+    if (dialHideTimer) clearTimeout(dialHideTimer);
+    dialHideTimer = setTimeout(() => {
+      dialHideTimer = 0;
+      hideDial(token);
+    }, 600);
+  }
 
-  async function uploadFile(file) {
+  function normalizeRelPath(raw) {
+    const cleaned = String(raw || "")
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "");
+    if (!cleaned) return null;
+    const parts = [];
+    for (const seg of cleaned.split("/")) {
+      if (!seg || seg === ".") continue;
+      if (seg === "..") return null;
+      if (/[\u0000-\u001f\u007f<>"]/.test(seg)) return null;
+      if (RESERVED_SUFFIXES.some((s) => seg.endsWith(s))) return null;
+      parts.push(seg);
+    }
+    if (!parts.length || parts.length > MAX_UPLOAD_DEPTH) return null;
+    return parts.join("/");
+  }
+
+  /** Relative path for upload destination (folder picks / drops preserve tree). */
+  function relativeUploadPath(item) {
+    const file = item.file || item;
+    const raw =
+      item.rel != null && String(item.rel).length
+        ? item.rel
+        : file.webkitRelativePath || file.name;
+    return normalizeRelPath(raw);
+  }
+
+  function toUploadItems(files) {
+    return [...files].map((f) => {
+      if (f && f.file instanceof Blob) return f;
+      return { file: f, rel: f.webkitRelativePath || f.name };
+    });
+  }
+
+  async function uploadFiles(files) {
+    if (uploading) throw new Error("An upload is already in progress.");
+    const items = toUploadItems(files).filter((it) => it.file && it.file.size > 0);
+    if (!items.length) {
+      throw new Error("No files to upload (empty folders and zero-byte files are skipped).");
+    }
+    if (items.length > MAX_UPLOAD_FILES) {
+      throw new Error(`Too many files to upload at once (max ${MAX_UPLOAD_FILES}).`);
+    }
+
+    const prepared = [];
+    const skipped = [];
+    let totalBytes = 0;
+    for (const it of items) {
+      const rel = relativeUploadPath(it);
+      if (!rel) {
+        skipped.push(it.file.name || "(unnamed)");
+        continue;
+      }
+      totalBytes += it.file.size;
+      if (totalBytes > MAX_UPLOAD_BYTES) {
+        throw new Error("Folder upload exceeds the maximum total size.");
+      }
+      prepared.push({ file: it.file, rel });
+    }
+    if (!prepared.length) {
+      throw new Error(
+        skipped.length
+          ? `No valid files to upload (skipped ${skipped.length} unsafe/reserved path(s)).`
+          : "No files to upload (empty folders and zero-byte files are skipped)."
+      );
+    }
+
     const base = state.path || "shared";
-    const dest = `${base.replace(/\/$/, "")}/${file.name}`;
+    const threshold = state.status?.large_threshold || 100 * 1024 * 1024;
+    const batch = prepared.length > 1 || totalBytes >= threshold;
+    let token = 0;
+    uploading = true;
+    setUploadControlsDisabled(true);
+
+    const failures = [];
+    let doneBytes = 0;
+    let okCount = 0;
+    try {
+      if (batch) {
+        token = showDial(
+          prepared.length > 1 ? `Upload · ${prepared.length} files` : "Upload"
+        );
+        updateDial(0, totalBytes, prepared[0].rel, token);
+      }
+
+      for (const item of prepared) {
+        try {
+          await uploadFile(item, {
+            base,
+            manageDial: !batch,
+            dialToken: token,
+            onProgress: (offset) => {
+              if (batch) updateDial(doneBytes + offset, totalBytes, item.rel, token);
+            },
+          });
+          doneBytes += item.file.size;
+          okCount += 1;
+          if (batch) updateDial(doneBytes, totalBytes, item.rel, token);
+        } catch (err) {
+          failures.push(`${item.rel}: ${err.message}`);
+        }
+      }
+    } finally {
+      uploading = false;
+      setUploadControlsDisabled(false);
+      if (batch) {
+        const summary =
+          failures.length === 0
+            ? "Done"
+            : `Uploaded ${okCount}/${prepared.length}`;
+        updateDial(doneBytes, totalBytes, summary, token);
+        scheduleHideDial(token);
+      }
+    }
+
+    if (failures.length) {
+      const extra = skipped.length ? `\nSkipped ${skipped.length} unsafe/reserved path(s).` : "";
+      throw new Error(
+        `Uploaded ${okCount}/${prepared.length}. Failed:\n${failures.slice(0, 8).join("\n")}${
+          failures.length > 8 ? `\n…and ${failures.length - 8} more` : ""
+        }${extra}`
+      );
+    }
+    if (skipped.length) {
+      alert(`Uploaded ${okCount} file(s). Skipped ${skipped.length} unsafe/reserved path(s).`);
+    }
+  }
+
+  function setUploadControlsDisabled(disabled) {
+    const file = $("#file-input");
+    const folder = $("#folder-input");
+    if (file) file.disabled = disabled;
+    if (folder) folder.disabled = disabled;
+  }
+
+  async function uploadFile(item, opts = {}) {
+    const manageDial = opts.manageDial !== false;
+    const onProgress = opts.onProgress || (() => {});
+    const file = item.file || item;
+    const rel = item.rel || relativeUploadPath(item);
+    if (!rel) throw new Error("invalid upload path");
+    const base = opts.base || state.path || "shared";
+    const dest = `${base.replace(/\/$/, "")}/${rel}`;
     const large = file.size >= (state.status?.large_threshold || 100 * 1024 * 1024);
-    if (large) showDial("Upload");
+    let token = opts.dialToken || 0;
+    if (manageDial && large) token = showDial("Upload");
 
     const init = await api("/api/upload/init", {
       method: "POST",
@@ -481,17 +759,18 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "upload failed");
       offset = data.offset;
-      if (large) updateDial(offset, file.size, file.name);
+      onProgress(offset);
+      if (manageDial && large) updateDial(offset, file.size, rel, token);
     }
 
-    if (large) {
+    if (manageDial && large) {
       $("#dial-label").textContent = "Sealing";
-      updateDial(file.size, file.size, file.name);
+      updateDial(file.size, file.size, rel, token);
     }
     await api(`/api/upload/${id}/complete`, { method: "POST" });
-    if (large) {
-      updateDial(file.size, file.size, "Done");
-      setTimeout(hideDial, 600);
+    if (manageDial && large) {
+      updateDial(file.size, file.size, "Done", token);
+      scheduleHideDial(token);
     }
   }
 
@@ -505,7 +784,7 @@
       a.click();
       return;
     }
-    showDial("Download");
+    const token = showDial("Download");
     const total = size || 0;
 
     // Stream to disk when the File System Access API is available (TB-safe).
@@ -523,14 +802,14 @@
           if (d) break;
           await writable.write(value);
           done += value.length;
-          updateDial(done, len || done, name);
+          updateDial(done, len || done, name, token);
         }
         await writable.close();
-        setTimeout(hideDial, 500);
+        scheduleHideDial(token);
         return;
       } catch (e) {
         if (e.name === "AbortError") {
-          hideDial();
+          hideDial(token);
           return;
         }
         // fall through
@@ -538,12 +817,12 @@
     }
 
     // Fallback: browser download manager (no RAM blowup)
-    updateDial(0, total, "Handing off to browser…");
+    updateDial(0, total, "Handing off to browser…", token);
     const a = document.createElement("a");
     a.href = fileUrl(path);
     a.download = name;
     a.click();
-    setTimeout(hideDial, 900);
+    scheduleHideDial(token);
   }
 
   // Expose for future; browse uses anchor for small files

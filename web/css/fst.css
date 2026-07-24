@@ -175,6 +175,11 @@ a {
   text-underline-offset: 0.25em;
 }
 
+#main.drop-target {
+  outline: 1px dashed var(--ink);
+  outline-offset: -0.5rem;
+}
+
 #view {
   padding: 0.5rem var(--pad) var(--pad);
   flex: 1;
