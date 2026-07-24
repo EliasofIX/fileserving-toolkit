@@ -180,10 +180,6 @@ a {
   outline-offset: -0.5rem;
 }
 
-#main.drop-target #view {
-  opacity: 0.55;
-}
-
 #view {
   padding: 0.5rem var(--pad) var(--pad);
   flex: 1;

@@ -313,6 +313,11 @@ fn sanitize_rel(rel: &str) -> Result<PathBuf, String> {
                 if s.is_empty() || s == "." || s == ".." {
                     return Err("illegal path component".into());
                 }
+                if s.chars()
+                    .any(|ch| ch.is_control() || ch == '<' || ch == '>' || ch == '"' || ch == '\0')
+                {
+                    return Err("illegal character in path component".into());
+                }
                 out.push(s.as_ref());
             }
             Component::CurDir => {}

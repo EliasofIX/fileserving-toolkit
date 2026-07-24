@@ -12,6 +12,15 @@
   };
 
   const CHUNK = 8 * 1024 * 1024; // 8 MiB upload chunks
+  const MAX_UPLOAD_FILES = 5000;
+  const MAX_UPLOAD_DEPTH = 32;
+  const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024 * 1024; // 4 TiB total (matches server max_size ceiling)
+  const RESERVED_SUFFIXES = [".fst-meta", ".fst-idx", ".sk", ".ek", ".part"];
+
+  let chromeBound = false;
+  let uploading = false;
+  let dialToken = 0;
+  let dialHideTimer = 0;
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -122,6 +131,8 @@
   }
 
   function bindChrome() {
+    if (chromeBound) return;
+    chromeBound = true;
     $$("[data-nav]").forEach((a) => {
       a.onclick = (e) => {
         e.preventDefault();
@@ -145,22 +156,12 @@
     $("#file-input").onchange = async (e) => {
       const files = [...e.target.files];
       e.target.value = "";
-      try {
-        await uploadFiles(files);
-      } catch (err) {
-        alert(err.message);
-      }
-      await refresh();
+      await handleIncomingFiles(files);
     };
     $("#folder-input").onchange = async (e) => {
       const files = [...e.target.files];
       e.target.value = "";
-      try {
-        await uploadFiles(files);
-      } catch (err) {
-        alert(err.message);
-      }
-      await refresh();
+      await handleIncomingFiles(files);
     };
     bindDropTarget();
     $$("[data-close]").forEach((b) => {
@@ -171,29 +172,44 @@
     });
   }
 
+  async function handleIncomingFiles(files) {
+    try {
+      await uploadFiles(files);
+    } catch (err) {
+      alert(err.message);
+    }
+    await refresh();
+  }
+
+  function clearDropTarget(main) {
+    main.classList.remove("drop-target");
+  }
+
   function bindDropTarget() {
     const main = $("#main");
-    let depth = 0;
     const onDragOver = (e) => {
       if (![...e.dataTransfer.types].includes("Files")) return;
       e.preventDefault();
-      e.dataTransfer.dropEffect = "copy";
+      e.dataTransfer.dropEffect = uploading ? "none" : "copy";
     };
     main.addEventListener("dragenter", (e) => {
       if (![...e.dataTransfer.types].includes("Files")) return;
       e.preventDefault();
-      depth += 1;
-      main.classList.add("drop-target");
+      if (!uploading) main.classList.add("drop-target");
     });
-    main.addEventListener("dragleave", () => {
-      depth = Math.max(0, depth - 1);
-      if (depth === 0) main.classList.remove("drop-target");
+    main.addEventListener("dragleave", (e) => {
+      // Ignore crossings into children; only clear when leaving #main entirely.
+      if (e.relatedTarget && main.contains(e.relatedTarget)) return;
+      clearDropTarget(main);
     });
     main.addEventListener("dragover", onDragOver);
     main.addEventListener("drop", async (e) => {
       e.preventDefault();
-      depth = 0;
-      main.classList.remove("drop-target");
+      clearDropTarget(main);
+      if (uploading) {
+        alert("An upload is already in progress.");
+        return;
+      }
       try {
         const files = await collectDroppedFiles(e.dataTransfer);
         await uploadFiles(files);
@@ -202,6 +218,7 @@
       }
       await refresh();
     });
+    document.addEventListener("dragend", () => clearDropTarget(main));
   }
 
   /** Collect files from a drop, preserving folder relative paths when possible. */
@@ -214,22 +231,24 @@
         .map((it) => it.webkitGetAsEntry())
         .filter(Boolean);
       for (const entry of entries) {
-        await walkEntry(entry, "", files);
+        await walkEntry(entry, "", files, 0);
       }
       if (files.length) return files;
     }
-    return [...(dt.files || [])];
+    return [...(dt.files || [])].map((file) => ({ file, rel: file.webkitRelativePath || file.name }));
   }
 
-  async function walkEntry(entry, prefix, out) {
+  async function walkEntry(entry, prefix, out, depth) {
+    if (depth > MAX_UPLOAD_DEPTH) {
+      throw new Error(`Folder is too deep (max ${MAX_UPLOAD_DEPTH} levels).`);
+    }
+    if (out.length >= MAX_UPLOAD_FILES) {
+      throw new Error(`Too many files to upload at once (max ${MAX_UPLOAD_FILES}).`);
+    }
     if (entry.isFile) {
       const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
       const rel = prefix ? `${prefix}${file.name}` : file.name;
-      Object.defineProperty(file, "webkitRelativePath", {
-        value: rel,
-        configurable: true,
-      });
-      out.push(file);
+      out.push({ file, rel });
       return;
     }
     if (!entry.isDirectory) return;
@@ -240,7 +259,7 @@
       const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
       if (!batch.length) break;
       for (const child of batch) {
-        await walkEntry(child, dirPrefix, out);
+        await walkEntry(child, dirPrefix, out, depth + 1);
       }
     }
   }
@@ -275,23 +294,30 @@
 
   function renderCrumbs() {
     const el = $("#crumbs");
+    el.replaceChildren();
     const parts = (state.path || "").split("/").filter(Boolean);
-    let acc = "";
-    const bits = [
-      `<a href="#" data-p="">Library</a>`,
-      ...parts.map((p) => {
-        acc = acc ? `${acc}/${p}` : p;
-        const here = acc;
-        return `<span>/</span><a href="#" data-p="${here}">${escapeHtml(p)}</a>`;
-      }),
-    ];
-    el.innerHTML = bits.join(" ");
-    $$("[data-p]", el).forEach((a) => {
+
+    const addCrumb = (label, path) => {
+      const a = document.createElement("a");
+      a.href = "#";
+      a.textContent = label;
+      a.dataset.p = path;
       a.onclick = (e) => {
         e.preventDefault();
         navigate(state.nav, a.dataset.p);
       };
-    });
+      el.appendChild(a);
+    };
+
+    addCrumb("Library", "");
+    let acc = "";
+    for (const p of parts) {
+      const sep = document.createElement("span");
+      sep.textContent = " / ";
+      el.appendChild(sep);
+      acc = acc ? `${acc}/${p}` : p;
+      addCrumb(p, acc);
+    }
   }
 
   function escapeHtml(s) {
@@ -532,8 +558,14 @@
 
   /* Transfer Dial */
   function showDial(label) {
+    if (dialHideTimer) {
+      clearTimeout(dialHideTimer);
+      dialHideTimer = 0;
+    }
+    dialToken += 1;
     $("#transfer-dial").classList.remove("hidden");
     $("#dial-label").textContent = label;
+    return dialToken;
   }
   function updateDial(done, total, detail) {
     const pct = total ? Math.min(100, (done / total) * 100) : 0;
@@ -541,60 +573,163 @@
     $("#dial-fill").style.width = `${pct}%`;
     $("#dial-detail").textContent = detail || `${fmtSize(done)} / ${fmtSize(total)}`;
   }
-  function hideDial() {
+  function hideDial(token) {
+    if (token !== undefined && token !== dialToken) return;
     $("#transfer-dial").classList.add("hidden");
+  }
+  function scheduleHideDial(token) {
+    if (dialHideTimer) clearTimeout(dialHideTimer);
+    dialHideTimer = setTimeout(() => {
+      dialHideTimer = 0;
+      hideDial(token);
+    }, 600);
+  }
+
+  function normalizeRelPath(raw) {
+    const cleaned = String(raw || "")
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "");
+    if (!cleaned) return null;
+    const parts = [];
+    for (const seg of cleaned.split("/")) {
+      if (!seg || seg === ".") continue;
+      if (seg === "..") return null;
+      if (/[\u0000-\u001f\u007f<>"]/.test(seg)) return null;
+      if (RESERVED_SUFFIXES.some((s) => seg.endsWith(s))) return null;
+      parts.push(seg);
+    }
+    if (!parts.length || parts.length > MAX_UPLOAD_DEPTH) return null;
+    return parts.join("/");
   }
 
   /** Relative path for upload destination (folder picks / drops preserve tree). */
-  function relativeUploadPath(file) {
-    const rel = String(file.webkitRelativePath || "")
-      .replace(/\\/g, "/")
-      .replace(/^\/+/, "");
-    if (!rel || rel.includes("..")) return file.name;
-    return rel;
+  function relativeUploadPath(item) {
+    const file = item.file || item;
+    const raw =
+      item.rel != null && String(item.rel).length
+        ? item.rel
+        : file.webkitRelativePath || file.name;
+    return normalizeRelPath(raw);
+  }
+
+  function toUploadItems(files) {
+    return [...files].map((f) => {
+      if (f && f.file instanceof Blob) return f;
+      return { file: f, rel: f.webkitRelativePath || f.name };
+    });
   }
 
   async function uploadFiles(files) {
-    const list = [...files].filter((f) => f && f.size > 0);
-    if (!list.length) {
+    if (uploading) throw new Error("An upload is already in progress.");
+    const items = toUploadItems(files).filter((it) => it.file && it.file.size > 0);
+    if (!items.length) {
       throw new Error("No files to upload (empty folders and zero-byte files are skipped).");
     }
-    const threshold = state.status?.large_threshold || 100 * 1024 * 1024;
-    const totalBytes = list.reduce((s, f) => s + f.size, 0);
-    const batch = list.length > 1 || totalBytes >= threshold;
-    if (batch) {
-      showDial(list.length > 1 ? `Upload · ${list.length} files` : "Upload");
-      updateDial(0, totalBytes, relativeUploadPath(list[0]));
+    if (items.length > MAX_UPLOAD_FILES) {
+      throw new Error(`Too many files to upload at once (max ${MAX_UPLOAD_FILES}).`);
     }
 
+    const prepared = [];
+    const skipped = [];
+    let totalBytes = 0;
+    for (const it of items) {
+      const rel = relativeUploadPath(it);
+      if (!rel) {
+        skipped.push(it.file.name || "(unnamed)");
+        continue;
+      }
+      totalBytes += it.file.size;
+      if (totalBytes > MAX_UPLOAD_BYTES) {
+        throw new Error("Folder upload exceeds the maximum total size.");
+      }
+      prepared.push({ file: it.file, rel });
+    }
+    if (!prepared.length) {
+      throw new Error(
+        skipped.length
+          ? `No valid files to upload (skipped ${skipped.length} unsafe/reserved path(s)).`
+          : "No files to upload (empty folders and zero-byte files are skipped)."
+      );
+    }
+
+    const base = state.path || "shared";
+    const threshold = state.status?.large_threshold || 100 * 1024 * 1024;
+    const batch = prepared.length > 1 || totalBytes >= threshold;
+    let token = 0;
+    uploading = true;
+    setUploadControlsDisabled(true);
+
+    const failures = [];
     let doneBytes = 0;
+    let okCount = 0;
     try {
-      for (const file of list) {
-        const label = relativeUploadPath(file);
-        await uploadFile(file, {
-          manageDial: !batch,
-          onProgress: (offset) => {
-            if (batch) updateDial(doneBytes + offset, totalBytes, label);
-          },
-        });
-        doneBytes += file.size;
-        if (batch) updateDial(doneBytes, totalBytes, label);
+      if (batch) {
+        token = showDial(
+          prepared.length > 1 ? `Upload · ${prepared.length} files` : "Upload"
+        );
+        updateDial(0, totalBytes, prepared[0].rel);
+      }
+
+      for (const item of prepared) {
+        try {
+          await uploadFile(item, {
+            base,
+            manageDial: !batch,
+            onProgress: (offset) => {
+              if (batch) updateDial(doneBytes + offset, totalBytes, item.rel);
+            },
+          });
+          doneBytes += item.file.size;
+          okCount += 1;
+          if (batch) updateDial(doneBytes, totalBytes, item.rel);
+        } catch (err) {
+          failures.push(`${item.rel}: ${err.message}`);
+        }
       }
     } finally {
+      uploading = false;
+      setUploadControlsDisabled(false);
       if (batch) {
-        updateDial(doneBytes, totalBytes, doneBytes === totalBytes ? "Done" : "");
-        setTimeout(hideDial, 600);
+        const summary =
+          failures.length === 0
+            ? "Done"
+            : `Uploaded ${okCount}/${prepared.length}`;
+        updateDial(doneBytes, totalBytes, summary);
+        scheduleHideDial(token);
       }
+    }
+
+    if (failures.length) {
+      const extra = skipped.length ? `\nSkipped ${skipped.length} unsafe/reserved path(s).` : "";
+      throw new Error(
+        `Uploaded ${okCount}/${prepared.length}. Failed:\n${failures.slice(0, 8).join("\n")}${
+          failures.length > 8 ? `\n…and ${failures.length - 8} more` : ""
+        }${extra}`
+      );
+    }
+    if (skipped.length) {
+      alert(`Uploaded ${okCount} file(s). Skipped ${skipped.length} unsafe/reserved path(s).`);
     }
   }
 
-  async function uploadFile(file, opts = {}) {
+  function setUploadControlsDisabled(disabled) {
+    const file = $("#file-input");
+    const folder = $("#folder-input");
+    if (file) file.disabled = disabled;
+    if (folder) folder.disabled = disabled;
+  }
+
+  async function uploadFile(item, opts = {}) {
     const manageDial = opts.manageDial !== false;
     const onProgress = opts.onProgress || (() => {});
-    const base = state.path || "shared";
-    const dest = `${base.replace(/\/$/, "")}/${relativeUploadPath(file)}`;
+    const file = item.file || item;
+    const rel = item.rel || relativeUploadPath(item);
+    if (!rel) throw new Error("invalid upload path");
+    const base = opts.base || state.path || "shared";
+    const dest = `${base.replace(/\/$/, "")}/${rel}`;
     const large = file.size >= (state.status?.large_threshold || 100 * 1024 * 1024);
-    if (manageDial && large) showDial("Upload");
+    let token = 0;
+    if (manageDial && large) token = showDial("Upload");
 
     const init = await api("/api/upload/init", {
       method: "POST",
@@ -616,17 +751,17 @@
       if (!res.ok) throw new Error(data.error || "upload failed");
       offset = data.offset;
       onProgress(offset);
-      if (manageDial && large) updateDial(offset, file.size, relativeUploadPath(file));
+      if (manageDial && large) updateDial(offset, file.size, rel);
     }
 
     if (manageDial && large) {
       $("#dial-label").textContent = "Sealing";
-      updateDial(file.size, file.size, relativeUploadPath(file));
+      updateDial(file.size, file.size, rel);
     }
     await api(`/api/upload/${id}/complete`, { method: "POST" });
     if (manageDial && large) {
       updateDial(file.size, file.size, "Done");
-      setTimeout(hideDial, 600);
+      scheduleHideDial(token);
     }
   }
 

@@ -67,6 +67,7 @@ fn normalize_virtual_path(path: &str) -> Result<String, String> {
         if seg == ".." {
             return Err("illegal path component".into());
         }
+        validate_path_segment(seg)?;
         parts.push(seg);
     }
     if parts.is_empty() {
@@ -76,7 +77,30 @@ fn normalize_virtual_path(path: &str) -> Result<String, String> {
     if parts.len() < 2 {
         return Err("upload path must include a filename".into());
     }
+    if parts.len() > 64 {
+        return Err("upload path too deep".into());
+    }
+    if let Some(name) = parts.last() {
+        reject_reserved_name(name)?;
+    }
     Ok(parts.join("/"))
+}
+
+fn validate_path_segment(seg: &str) -> Result<(), String> {
+    if seg.chars().any(|c| {
+        c.is_control() || c == '<' || c == '>' || c == '"' || c == '\0'
+    }) {
+        return Err("illegal character in path component".into());
+    }
+    Ok(())
+}
+
+fn reject_reserved_name(name: &str) -> Result<(), String> {
+    const RESERVED: &[&str] = &[".fst-meta", ".fst-idx", ".sk", ".ek", ".part"];
+    if RESERVED.iter().any(|s| name.ends_with(s)) {
+        return Err("reserved filename suffix".into());
+    }
+    Ok(())
 }
 
 fn paths_match(a: &str, b: &str) -> bool {
@@ -809,6 +833,16 @@ cache_dir = "{0}/media"
         assert!(normalize_virtual_path("/shared/").is_err());
         assert!(normalize_virtual_path("shared/file.bin").is_ok());
         assert!(normalize_virtual_path("~alice/file.bin").is_ok());
+    }
+
+    #[test]
+    fn rejects_unsafe_and_reserved_upload_paths() {
+        assert!(normalize_virtual_path(r#"shared/"><img>/x.txt"#).is_err());
+        assert!(normalize_virtual_path("shared/a<b>/x.txt").is_err());
+        assert!(normalize_virtual_path("shared/my..notes/readme.txt").is_ok());
+        assert!(normalize_virtual_path("shared/secret.sk").is_err());
+        assert!(normalize_virtual_path("shared/nested/file.fst-meta").is_err());
+        assert!(normalize_virtual_path("shared/a/./b/c.txt").is_ok());
     }
 
     #[test]
