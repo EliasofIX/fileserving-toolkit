@@ -318,6 +318,10 @@ fn sanitize_rel(rel: &str) -> Result<PathBuf, String> {
                 {
                     return Err("illegal character in path component".into());
                 }
+                const RESERVED: &[&str] = &[".fst-meta", ".fst-idx", ".sk", ".ek", ".part"];
+                if RESERVED.iter().any(|suf| s.ends_with(suf)) {
+                    return Err("reserved filename suffix".into());
+                }
                 out.push(s.as_ref());
             }
             Component::CurDir => {}

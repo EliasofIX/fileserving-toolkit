@@ -239,7 +239,7 @@
   }
 
   async function walkEntry(entry, prefix, out, depth) {
-    if (depth > MAX_UPLOAD_DEPTH) {
+    if (depth >= MAX_UPLOAD_DEPTH) {
       throw new Error(`Folder is too deep (max ${MAX_UPLOAD_DEPTH} levels).`);
     }
     if (out.length >= MAX_UPLOAD_FILES) {
@@ -775,7 +775,7 @@
       a.click();
       return;
     }
-    showDial("Download");
+    const token = showDial("Download");
     const total = size || 0;
 
     // Stream to disk when the File System Access API is available (TB-safe).
@@ -796,11 +796,11 @@
           updateDial(done, len || done, name);
         }
         await writable.close();
-        setTimeout(hideDial, 500);
+        scheduleHideDial(token);
         return;
       } catch (e) {
         if (e.name === "AbortError") {
-          hideDial();
+          hideDial(token);
           return;
         }
         // fall through
@@ -813,7 +813,7 @@
     a.href = fileUrl(path);
     a.download = name;
     a.click();
-    setTimeout(hideDial, 900);
+    scheduleHideDial(token);
   }
 
   // Expose for future; browse uses anchor for small files

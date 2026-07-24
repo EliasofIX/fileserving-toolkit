@@ -68,6 +68,7 @@ fn normalize_virtual_path(path: &str) -> Result<String, String> {
             return Err("illegal path component".into());
         }
         validate_path_segment(seg)?;
+        reject_reserved_name(seg)?;
         parts.push(seg);
     }
     if parts.is_empty() {
@@ -79,9 +80,6 @@ fn normalize_virtual_path(path: &str) -> Result<String, String> {
     }
     if parts.len() > 64 {
         return Err("upload path too deep".into());
-    }
-    if let Some(name) = parts.last() {
-        reject_reserved_name(name)?;
     }
     Ok(parts.join("/"))
 }
@@ -842,6 +840,7 @@ cache_dir = "{0}/media"
         assert!(normalize_virtual_path("shared/my..notes/readme.txt").is_ok());
         assert!(normalize_virtual_path("shared/secret.sk").is_err());
         assert!(normalize_virtual_path("shared/nested/file.fst-meta").is_err());
+        assert!(normalize_virtual_path("shared/foo.sk/bar.txt").is_err());
         assert!(normalize_virtual_path("shared/a/./b/c.txt").is_ok());
     }
 
