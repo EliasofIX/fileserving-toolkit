@@ -145,15 +145,104 @@
     $("#file-input").onchange = async (e) => {
       const files = [...e.target.files];
       e.target.value = "";
-      for (const f of files) await uploadFile(f);
+      try {
+        await uploadFiles(files);
+      } catch (err) {
+        alert(err.message);
+      }
       await refresh();
     };
+    $("#folder-input").onchange = async (e) => {
+      const files = [...e.target.files];
+      e.target.value = "";
+      try {
+        await uploadFiles(files);
+      } catch (err) {
+        alert(err.message);
+      }
+      await refresh();
+    };
+    bindDropTarget();
     $$("[data-close]").forEach((b) => {
       b.onclick = () => closeStages();
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") closeStages();
     });
+  }
+
+  function bindDropTarget() {
+    const main = $("#main");
+    let depth = 0;
+    const onDragOver = (e) => {
+      if (![...e.dataTransfer.types].includes("Files")) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+    };
+    main.addEventListener("dragenter", (e) => {
+      if (![...e.dataTransfer.types].includes("Files")) return;
+      e.preventDefault();
+      depth += 1;
+      main.classList.add("drop-target");
+    });
+    main.addEventListener("dragleave", () => {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) main.classList.remove("drop-target");
+    });
+    main.addEventListener("dragover", onDragOver);
+    main.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      depth = 0;
+      main.classList.remove("drop-target");
+      try {
+        const files = await collectDroppedFiles(e.dataTransfer);
+        await uploadFiles(files);
+      } catch (err) {
+        alert(err.message);
+      }
+      await refresh();
+    });
+  }
+
+  /** Collect files from a drop, preserving folder relative paths when possible. */
+  async function collectDroppedFiles(dt) {
+    const items = [...(dt.items || [])];
+    if (items.length && items.some((it) => typeof it.webkitGetAsEntry === "function")) {
+      const files = [];
+      const entries = items
+        .filter((it) => it.kind === "file")
+        .map((it) => it.webkitGetAsEntry())
+        .filter(Boolean);
+      for (const entry of entries) {
+        await walkEntry(entry, "", files);
+      }
+      if (files.length) return files;
+    }
+    return [...(dt.files || [])];
+  }
+
+  async function walkEntry(entry, prefix, out) {
+    if (entry.isFile) {
+      const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+      const rel = prefix ? `${prefix}${file.name}` : file.name;
+      Object.defineProperty(file, "webkitRelativePath", {
+        value: rel,
+        configurable: true,
+      });
+      out.push(file);
+      return;
+    }
+    if (!entry.isDirectory) return;
+    const dirPrefix = `${prefix}${entry.name}/`;
+    const reader = entry.createReader();
+    // readEntries may return partial batches; keep reading until empty.
+    for (;;) {
+      const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+      if (!batch.length) break;
+      for (const child of batch) {
+        await walkEntry(child, dirPrefix, out);
+      }
+    }
   }
 
   function closeStages() {
@@ -215,7 +304,7 @@
     const view = $("#view");
     view.className = "view-browse";
     if (!state.entries.length) {
-      view.innerHTML = `<p class="empty">Nothing here. Upload a file or open a folder.</p>`;
+      view.innerHTML = `<p class="empty">Nothing here. Upload files or a folder, or open a path.</p>`;
       return;
     }
     const ul = document.createElement("ul");
@@ -456,11 +545,56 @@
     $("#transfer-dial").classList.add("hidden");
   }
 
-  async function uploadFile(file) {
+  /** Relative path for upload destination (folder picks / drops preserve tree). */
+  function relativeUploadPath(file) {
+    const rel = String(file.webkitRelativePath || "")
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "");
+    if (!rel || rel.includes("..")) return file.name;
+    return rel;
+  }
+
+  async function uploadFiles(files) {
+    const list = [...files].filter((f) => f && f.size > 0);
+    if (!list.length) {
+      throw new Error("No files to upload (empty folders and zero-byte files are skipped).");
+    }
+    const threshold = state.status?.large_threshold || 100 * 1024 * 1024;
+    const totalBytes = list.reduce((s, f) => s + f.size, 0);
+    const batch = list.length > 1 || totalBytes >= threshold;
+    if (batch) {
+      showDial(list.length > 1 ? `Upload · ${list.length} files` : "Upload");
+      updateDial(0, totalBytes, relativeUploadPath(list[0]));
+    }
+
+    let doneBytes = 0;
+    try {
+      for (const file of list) {
+        const label = relativeUploadPath(file);
+        await uploadFile(file, {
+          manageDial: !batch,
+          onProgress: (offset) => {
+            if (batch) updateDial(doneBytes + offset, totalBytes, label);
+          },
+        });
+        doneBytes += file.size;
+        if (batch) updateDial(doneBytes, totalBytes, label);
+      }
+    } finally {
+      if (batch) {
+        updateDial(doneBytes, totalBytes, doneBytes === totalBytes ? "Done" : "");
+        setTimeout(hideDial, 600);
+      }
+    }
+  }
+
+  async function uploadFile(file, opts = {}) {
+    const manageDial = opts.manageDial !== false;
+    const onProgress = opts.onProgress || (() => {});
     const base = state.path || "shared";
-    const dest = `${base.replace(/\/$/, "")}/${file.name}`;
+    const dest = `${base.replace(/\/$/, "")}/${relativeUploadPath(file)}`;
     const large = file.size >= (state.status?.large_threshold || 100 * 1024 * 1024);
-    if (large) showDial("Upload");
+    if (manageDial && large) showDial("Upload");
 
     const init = await api("/api/upload/init", {
       method: "POST",
@@ -481,15 +615,16 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "upload failed");
       offset = data.offset;
-      if (large) updateDial(offset, file.size, file.name);
+      onProgress(offset);
+      if (manageDial && large) updateDial(offset, file.size, relativeUploadPath(file));
     }
 
-    if (large) {
+    if (manageDial && large) {
       $("#dial-label").textContent = "Sealing";
-      updateDial(file.size, file.size, file.name);
+      updateDial(file.size, file.size, relativeUploadPath(file));
     }
     await api(`/api/upload/${id}/complete`, { method: "POST" });
-    if (large) {
+    if (manageDial && large) {
       updateDial(file.size, file.size, "Done");
       setTimeout(hideDial, 600);
     }
