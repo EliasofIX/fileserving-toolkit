@@ -526,9 +526,17 @@ a {
   letter-spacing: -0.01em;
 }
 
-#music-meta {
+.music-artist {
   color: var(--muted);
-  margin: 0.75rem 0 2.5rem;
+  font-size: 1.05rem;
+  margin: 0.55rem 0 0;
+}
+
+.music-filename {
+  color: var(--muted);
+  font-size: 0.85rem;
+  opacity: 0.85;
+  margin: 0.45rem 0 2.5rem;
 }
 
 .music-controls {

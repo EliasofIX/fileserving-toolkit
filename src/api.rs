@@ -49,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/file", get(api_file))
         .route("/api/stream", get(api_stream))
         .route("/api/media/info", get(api_media_info))
+        .route("/api/audio/meta", get(api_audio_meta))
         .route("/", get(static_index))
         .route("/{*path}", get(static_asset))
         .layer(CompressionLayer::new())
@@ -706,6 +707,91 @@ async fn api_media_info(
         "path": path,
         "kind": kind,
         "ffmpeg": st.media.available(),
+    }))
+    .into_response()
+}
+
+async fn api_audio_meta(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PathQuery>,
+) -> Response {
+    let sess = match require_auth(&headers, &st.auth) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let path = q.path.unwrap_or_default();
+    let name = path.rsplit('/').next().unwrap_or(&path);
+    if crate::storage::classify(name) != "audio" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "not an audio file"})),
+        )
+            .into_response();
+    }
+    let fs_path = match st.storage.resolve(&path, sess.as_ref()) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response()
+        }
+    };
+    if !fs_path.is_file() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not found"})),
+        )
+            .into_response();
+    }
+
+    let artist = if st.cfg.encryption.enabled && crypto::is_encrypted_file(&fs_path) {
+        let sess = match &sess {
+            Some(s) => s,
+            None => return (StatusCode::UNAUTHORIZED, "auth required").into_response(),
+        };
+        let secrets = match st.auth.dek_for_path(&path, sess) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": e})),
+                )
+                    .into_response()
+            }
+        };
+        let cache = &st.cfg.media.cache_dir;
+        if let Err(e) = std::fs::create_dir_all(cache) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("cache dir: {e}")})),
+            )
+                .into_response();
+        }
+        let tmp = cache.join(format!("audio-meta-{}.tmp", uuid::Uuid::new_v4()));
+        let decrypt_result = crypto::decrypt_file(&fs_path, &tmp, &secrets.kem_dk);
+        let artist = match decrypt_result {
+            Ok(()) => crate::audio_meta::read_artist(&tmp),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("decrypt: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        let _ = std::fs::remove_file(&tmp);
+        artist
+    } else {
+        crate::audio_meta::read_artist(&fs_path)
+    };
+
+    Json(serde_json::json!({
+        "path": path,
+        "artist": artist,
     }))
     .into_response()
 }

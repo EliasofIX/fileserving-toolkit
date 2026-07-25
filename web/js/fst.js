@@ -12,6 +12,7 @@
   };
 
   const CHUNK = 8 * 1024 * 1024; // 8 MiB upload chunks
+  let musicMetaSeq = 0;
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -409,12 +410,30 @@
     closeStages();
     const stage = $("#music-stage");
     const audio = $("#audio-el");
+    const artistEl = $("#music-artist");
     $("#music-title").textContent = e.name.replace(/\.[^.]+$/, "");
-    $("#music-meta").textContent = e.name;
+    $("#music-filename").textContent = e.name;
+    artistEl.textContent = "";
+    artistEl.hidden = true;
     audio.src = fileUrl(e.path);
     stage.classList.remove("hidden");
     stage.focus();
     audio.play().catch(() => {});
+
+    const metaReq = ++musicMetaSeq;
+    fetch(`/api/audio/meta?path=${encodeURIComponent(e.path)}`, {
+      credentials: "same-origin",
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (metaReq !== musicMetaSeq) return;
+        const artist = data && data.artist;
+        if (typeof artist === "string" && artist.trim()) {
+          artistEl.textContent = artist.trim();
+          artistEl.hidden = false;
+        }
+      })
+      .catch(() => {});
 
     const btn = $("#music-play");
     const scrub = $("#music-scrub");

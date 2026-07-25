@@ -1,6 +1,7 @@
 //! fileserving-toolkit (FST) — suckless file server.
 
 mod api;
+mod audio_meta;
 mod auth;
 mod config;
 mod crypto;
