@@ -46,6 +46,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 clap = { version = "4", features = ["derive"] }
 subtle = "2"
+lofty = "0.21" # pinned: 0.22+ pulls edition2024 deps
 
 [profile.release]
 lto = true
