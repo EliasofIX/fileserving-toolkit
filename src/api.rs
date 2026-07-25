@@ -762,31 +762,33 @@ async fn api_audio_meta(
                     .into_response()
             }
         };
-        let cache = &st.cfg.media.cache_dir;
-        if let Err(e) = std::fs::create_dir_all(cache) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("cache dir: {e}")})),
-            )
-                .into_response();
-        }
-        let tmp = cache.join(format!("audio-meta-{}.tmp", uuid::Uuid::new_v4()));
-        let decrypt_result = crypto::decrypt_file(&fs_path, &tmp, &secrets.kem_dk);
-        let artist = match decrypt_result {
-            Ok(()) => crate::audio_meta::read_artist(&tmp),
+        let dk = secrets.kem_dk.clone();
+        let hint = name.to_string();
+        match tokio::task::spawn_blocking(move || {
+            crate::audio_meta::read_artist_encrypted(&fs_path, &dk, &hint)
+        })
+        .await
+        {
+            Ok(artist) => artist,
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("decrypt: {e}")})),
+                    Json(serde_json::json!({"error": format!("meta task: {e}")})),
                 )
-                    .into_response();
+                    .into_response()
             }
-        };
-        let _ = std::fs::remove_file(&tmp);
-        artist
+        }
     } else {
-        crate::audio_meta::read_artist(&fs_path)
+        match tokio::task::spawn_blocking(move || crate::audio_meta::read_artist(&fs_path)).await {
+            Ok(artist) => artist,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("meta task: {e}")})),
+                )
+                    .into_response()
+            }
+        }
     };
 
     Json(serde_json::json!({
