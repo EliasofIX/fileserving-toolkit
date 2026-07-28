@@ -417,31 +417,36 @@ impl TransferManager {
         mut body: impl Read,
         session: Option<&Session>,
     ) -> Result<UploadSession, String> {
-        let mut map = self.sessions.lock();
-        let sess = map.get_mut(id).ok_or("unknown upload")?;
-        self.authorize(sess, session)?;
-        if self.finalizing.lock().contains(&sess.virtual_path) {
-            return Err("upload already finalizing".into());
-        }
-        if offset != sess.offset {
-            return Err(format!(
-                "offset mismatch: client={offset} server={}",
-                sess.offset
-            ));
-        }
-        if sess.offset >= sess.size {
-            return Err("upload already complete".into());
-        }
+        // Validate + snapshot under lock, then release before disk I/O.
+        // Holding sessions across exfat writes froze the whole server during big uploads.
+        let (temp_path, size) = {
+            let map = self.sessions.lock();
+            let sess = map.get(id).ok_or("unknown upload")?;
+            self.authorize(sess, session)?;
+            if self.finalizing.lock().contains(&sess.virtual_path) {
+                return Err("upload already finalizing".into());
+            }
+            if offset != sess.offset {
+                return Err(format!(
+                    "offset mismatch: client={offset} server={}",
+                    sess.offset
+                ));
+            }
+            if sess.offset >= sess.size {
+                return Err("upload already complete".into());
+            }
+            (sess.temp_path.clone(), sess.size)
+        };
 
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .open(&sess.temp_path)
+            .open(&temp_path)
             .map_err(|e| e.to_string())?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| e.to_string())?;
 
         let mut buf = vec![0u8; self.buffer_size.min(8 * 1024 * 1024)];
-        let remaining = sess.size - sess.offset;
+        let remaining = size - offset;
         let mut written: u64 = 0;
         while written < remaining {
             let want = ((remaining - written) as usize).min(buf.len());
@@ -453,9 +458,19 @@ impl TransferManager {
             written += n as u64;
         }
         file.flush().map_err(|e| e.to_string())?;
-        let _ = file.sync_data();
+        // Avoid full fsync on every chunk — catastrophic on large sequential USB/exfat uploads.
+        // complete()/seal still durability-fences the final object.
 
-        sess.offset += written;
+        let mut map = self.sessions.lock();
+        let sess = map.get_mut(id).ok_or("unknown upload")?;
+        // Reject if another writer advanced the cursor while we were on disk.
+        if sess.offset != offset {
+            return Err(format!(
+                "concurrent write detected: expected offset {offset}, now {}",
+                sess.offset
+            ));
+        }
+        sess.offset = offset + written;
         sess.updated = Self::now();
         Self::persist(sess, &self.state_dir)?;
         Ok(sess.clone())
