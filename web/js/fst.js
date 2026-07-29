@@ -472,8 +472,12 @@
     const showPreviewAt = (ratio) => {
       if (!isFinite(video.duration) || video.duration <= 0) return;
       const t = ratio * video.duration;
+      const scrubW = scrub.clientWidth || 1;
+      const half = Math.min(90, scrubW * 0.12);
+      const px = ratio * scrubW;
+      const clamped = Math.min(scrubW - half, Math.max(half, px));
       previewTime.textContent = fmtTime(t);
-      preview.style.left = `${ratio * 100}%`;
+      preview.style.left = `${clamped}px`;
       preview.classList.remove("hidden");
       preview.setAttribute("aria-hidden", "false");
       const token = ++previewSeekToken;
@@ -492,6 +496,29 @@
       if (scrubbing) return;
       preview.classList.add("hidden");
       preview.setAttribute("aria-hidden", "true");
+    };
+    const syncFsBtn = () => {
+      const on =
+        document.fullscreenElement === frame ||
+        document.webkitFullscreenElement === frame;
+      frame.classList.toggle("is-fullscreen", on);
+      fsBtn.setAttribute("aria-label", on ? "Exit fullscreen" : "Fullscreen");
+      fsBtn.title = on ? "Exit fullscreen" : "Fullscreen";
+      fsBtn.innerHTML = on
+        ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+        : `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    };
+    const toggleFullscreen = async () => {
+      try {
+        if (document.fullscreenElement === frame) {
+          await document.exitFullscreen();
+        } else if (frame.requestFullscreen) {
+          await frame.requestFullscreen();
+        } else if (frame.webkitRequestFullscreen) {
+          frame.webkitRequestFullscreen();
+        }
+      } catch (_) {}
+      syncFsBtn();
     };
 
     playBtn.onclick = (ev) => {
@@ -547,31 +574,31 @@
     };
     scrub.onmouseleave = hidePreview;
 
-    const syncFsBtn = () => {
-      const on =
-        document.fullscreenElement === frame ||
-        document.webkitFullscreenElement === frame;
-      frame.classList.toggle("is-fullscreen", on);
-      fsBtn.setAttribute("aria-label", on ? "Exit fullscreen" : "Fullscreen");
-      fsBtn.title = on ? "Exit fullscreen" : "Fullscreen";
-      fsBtn.innerHTML = on
-        ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`
-        : `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-    };
-    fsBtn.onclick = async (ev) => {
+    fsBtn.onclick = (ev) => {
       ev.stopPropagation();
-      try {
-        if (document.fullscreenElement === frame) {
-          await document.exitFullscreen();
-        } else if (frame.requestFullscreen) {
-          await frame.requestFullscreen();
-        } else if (frame.webkitRequestFullscreen) {
-          frame.webkitRequestFullscreen();
-        }
-      } catch (_) {}
-      syncFsBtn();
+      toggleFullscreen();
     };
     document.onfullscreenchange = syncFsBtn;
+
+    stage.onkeydown = (ev) => {
+      if (stage.classList.contains("hidden")) return;
+      const tag = (ev.target && ev.target.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (ev.key === " " || ev.code === "Space") {
+        ev.preventDefault();
+        toggle();
+      } else if (ev.key === "ArrowLeft") {
+        ev.preventDefault();
+        seekBy(-10);
+      } else if (ev.key === "ArrowRight") {
+        ev.preventDefault();
+        seekBy(10);
+      } else if (ev.key === "f" || ev.key === "F") {
+        ev.preventDefault();
+        toggleFullscreen();
+      }
+    };
+
     syncFsBtn();
     syncPlaying();
   }
