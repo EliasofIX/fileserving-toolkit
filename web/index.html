@@ -69,9 +69,21 @@
       <video id="video-preview-el" muted playsinline preload="auto" class="preview-source" tabindex="-1" aria-hidden="true"></video>
       <div class="theater-ui">
         <div class="theater-center">
-          <button type="button" id="video-back" class="skip-glyph" aria-label="Back 10 seconds">−10</button>
+          <button type="button" id="video-back" class="skip-glyph" aria-label="Back 10 seconds">
+            <svg viewBox="0 0 40 40" aria-hidden="true">
+              <path d="M20 8a12 12 0 1 0 10.4 6.1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+              <path d="M18.5 5.5 L20.2 9.2 L16.4 9.8 Z" fill="currentColor"/>
+            </svg>
+            <span>10</span>
+          </button>
           <button type="button" id="video-play" class="play-glyph" aria-label="Play">▶</button>
-          <button type="button" id="video-fwd" class="skip-glyph" aria-label="Forward 10 seconds">+10</button>
+          <button type="button" id="video-fwd" class="skip-glyph" aria-label="Forward 10 seconds">
+            <svg viewBox="0 0 40 40" aria-hidden="true">
+              <path d="M20 8a12 12 0 1 1 -10.4 6.1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+              <path d="M21.5 5.5 L19.8 9.2 L23.6 9.8 Z" fill="currentColor"/>
+            </svg>
+            <span>10</span>
+          </button>
         </div>
         <div class="scrub">
           <div id="video-preview" class="scrub-preview hidden" aria-hidden="true">
@@ -83,7 +95,11 @@
         <p id="video-title"></p>
         <div class="theater-meta">
           <span id="video-time" class="video-time">0:00 / 0:00</span>
-          <button type="button" id="video-fs" class="fs-btn" aria-label="Fullscreen" title="Fullscreen">⛶</button>
+          <button type="button" id="video-fs" class="fs-btn" aria-label="Fullscreen" title="Fullscreen">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
         </div>
       </div>
     </div>

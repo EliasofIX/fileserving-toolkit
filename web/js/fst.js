@@ -410,6 +410,7 @@
     $("#video-title").textContent = e.name;
     timeEl.textContent = "0:00 / 0:00";
     scrub.value = 0;
+    scrub.style.background = "rgba(255,255,255,0.28)";
     preview.classList.add("hidden");
     video.src = src;
     previewVid.src = src;
@@ -420,16 +421,23 @@
     const syncPlaying = () => {
       frame.classList.toggle("playing", !video.paused);
     };
+    const paintScrub = (ratio) => {
+      const pct = Math.min(100, Math.max(0, ratio * 100));
+      scrub.style.background = `linear-gradient(to right, #fff ${pct}%, rgba(255,255,255,0.28) ${pct}%)`;
+    };
     const updateTime = () => {
       const dur = video.duration;
       if (!isFinite(dur) || dur <= 0) {
         timeEl.textContent = `${fmtTime(video.currentTime)} / 0:00`;
+        paintScrub(0);
         return;
       }
       timeEl.textContent = `${fmtTime(video.currentTime)} / ${fmtTime(dur)}`;
+      const ratio = video.currentTime / dur;
       if (!scrubbing) {
-        scrub.value = Math.floor((video.currentTime / dur) * 1000);
+        scrub.value = Math.floor(ratio * 1000);
       }
+      paintScrub(scrub.value / 1000);
     };
     const seekBy = (delta) => {
       if (!isFinite(video.duration)) return;
@@ -467,6 +475,7 @@
       previewTime.textContent = fmtTime(t);
       preview.style.left = `${ratio * 100}%`;
       preview.classList.remove("hidden");
+      preview.setAttribute("aria-hidden", "false");
       const token = ++previewSeekToken;
       const apply = () => {
         if (token !== previewSeekToken) return;
@@ -482,6 +491,7 @@
     const hidePreview = () => {
       if (scrubbing) return;
       preview.classList.add("hidden");
+      preview.setAttribute("aria-hidden", "true");
     };
 
     playBtn.onclick = (ev) => {
@@ -541,8 +551,12 @@
       const on =
         document.fullscreenElement === frame ||
         document.webkitFullscreenElement === frame;
+      frame.classList.toggle("is-fullscreen", on);
       fsBtn.setAttribute("aria-label", on ? "Exit fullscreen" : "Fullscreen");
       fsBtn.title = on ? "Exit fullscreen" : "Fullscreen";
+      fsBtn.innerHTML = on
+        ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+        : `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     };
     fsBtn.onclick = async (ev) => {
       ev.stopPropagation();
