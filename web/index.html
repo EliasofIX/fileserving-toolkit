@@ -64,14 +64,27 @@
   <!-- Video theater -->
   <div id="video-stage" class="overlay stage theater hidden" tabindex="0">
     <button type="button" class="stage-close" data-close>Close</button>
-    <div class="theater-frame">
+    <div class="theater-frame" id="theater-frame">
       <video id="video-el" playsinline></video>
+      <video id="video-preview-el" muted playsinline preload="auto" class="preview-source" tabindex="-1" aria-hidden="true"></video>
       <div class="theater-ui">
-        <button type="button" id="video-play" class="play-glyph" aria-label="Play">▶</button>
+        <div class="theater-center">
+          <button type="button" id="video-back" class="skip-glyph" aria-label="Back 10 seconds">−10</button>
+          <button type="button" id="video-play" class="play-glyph" aria-label="Play">▶</button>
+          <button type="button" id="video-fwd" class="skip-glyph" aria-label="Forward 10 seconds">+10</button>
+        </div>
         <div class="scrub">
-          <input type="range" id="video-scrub" min="0" max="1000" value="0" />
+          <div id="video-preview" class="scrub-preview hidden" aria-hidden="true">
+            <canvas id="video-preview-canvas" width="160" height="90"></canvas>
+            <span id="video-preview-time"></span>
+          </div>
+          <input type="range" id="video-scrub" min="0" max="1000" value="0" aria-label="Seek" />
         </div>
         <p id="video-title"></p>
+        <div class="theater-meta">
+          <span id="video-time" class="video-time">0:00 / 0:00</span>
+          <button type="button" id="video-fs" class="fs-btn" aria-label="Fullscreen" title="Fullscreen">⛶</button>
+        </div>
       </div>
     </div>
   </div>

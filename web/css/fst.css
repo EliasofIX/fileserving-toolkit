@@ -427,11 +427,37 @@ a {
   width: min(96vw, 1600px);
 }
 
-.theater-frame video {
+.theater-frame:fullscreen,
+.theater-frame:-webkit-full-screen {
+  width: 100%;
+  height: 100%;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.theater-frame video#video-el {
   width: 100%;
   max-height: 82vh;
   background: #000;
   display: block;
+}
+
+.theater-frame:fullscreen video#video-el,
+.theater-frame:-webkit-full-screen video#video-el {
+  max-height: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.theater-frame .preview-source {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
 }
 
 .theater-ui {
@@ -442,27 +468,53 @@ a {
   align-items: center;
   justify-content: center;
   pointer-events: none;
-  background: linear-gradient(transparent 60%, rgba(0, 0, 0, 0.55));
+  background: linear-gradient(transparent 55%, rgba(0, 0, 0, 0.6));
 }
 
-.theater-ui .play-glyph {
+.theater-center {
+  display: flex;
+  align-items: center;
+  gap: 1.75rem;
   pointer-events: auto;
+}
+
+.theater-ui .play-glyph,
+.theater-ui .skip-glyph {
   background: none;
   border: none;
   color: #fff;
-  font-size: 3rem;
   cursor: pointer;
   opacity: 0.9;
   text-shadow: 0 1px 12px rgba(0, 0, 0, 0.5);
+  font-family: inherit;
+  line-height: 1;
+  padding: 0.35rem;
 }
 
-.theater-frame.playing .play-glyph {
+.theater-ui .play-glyph {
+  font-size: 3rem;
+}
+
+.theater-ui .skip-glyph {
+  font-size: 1.05rem;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+  min-width: 2.5rem;
+}
+
+.theater-ui .skip-glyph:hover,
+.theater-ui .play-glyph:hover {
+  opacity: 1;
+}
+
+.theater-frame.playing .theater-center {
   opacity: 0;
   transition: opacity 0.4s;
 }
 
-.theater-frame.playing:hover .play-glyph {
-  opacity: 0.7;
+.theater-frame.playing:hover .theater-center {
+  opacity: 0.85;
 }
 
 .theater-ui .scrub {
@@ -490,13 +542,89 @@ a {
   background: #fff;
 }
 
+.theater-ui .scrub input::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: none;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.scrub-preview {
+  position: absolute;
+  bottom: calc(100% + 0.65rem);
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.scrub-preview.hidden {
+  display: none;
+}
+
+.scrub-preview canvas {
+  width: 160px;
+  height: 90px;
+  background: #111;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  object-fit: contain;
+}
+
+.scrub-preview span {
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.9);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
+}
+
 #video-title {
   position: absolute;
   left: 1.5rem;
+  right: 8.5rem;
   bottom: 0.7rem;
   margin: 0;
   font-size: 0.85rem;
   color: rgba(255, 255, 255, 0.7);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.theater-meta {
+  position: absolute;
+  right: 1.5rem;
+  bottom: 0.55rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  pointer-events: auto;
+}
+
+.video-time {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.75);
+  letter-spacing: 0.02em;
+}
+
+.fs-btn {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  font-size: 1.05rem;
+  line-height: 1;
+  padding: 0.15rem;
+}
+
+.fs-btn:hover {
+  color: #fff;
 }
 
 /* Music panel */
