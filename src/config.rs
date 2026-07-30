@@ -175,6 +175,10 @@ impl Config {
         std::fs::create_dir_all(&self.paths.shared_root)?;
         std::fs::create_dir_all(&self.paths.users_root)?;
         std::fs::create_dir_all(&self.paths.upload_state_dir)?;
+        if self.encryption.enabled {
+            std::fs::create_dir_all(crate::crypto::keystore_dir(&self.server.data_dir))?;
+            std::fs::create_dir_all(crate::crypto::sessions_dir(&self.server.data_dir))?;
+        }
         if !self.media.cache_dir.as_os_str().is_empty() {
             std::fs::create_dir_all(&self.media.cache_dir)?;
         }

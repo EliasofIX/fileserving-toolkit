@@ -1,6 +1,8 @@
 //! HTTP API + static UI serving.
 
-use crate::auth::{AuthState, Session, SESSION_COOKIE};
+use crate::auth::{
+    clear_session_cookie, session_cookie_value, AuthState, Session, SESSION_COOKIE,
+};
 use crate::config::Config;
 use crate::crypto;
 use crate::media::Media;
@@ -12,6 +14,7 @@ use axum::http::{
     header::{self, HeaderMap, HeaderValue},
     StatusCode,
 };
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -35,7 +38,7 @@ pub struct AppState {
 struct Assets;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
@@ -50,22 +53,63 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stream", get(api_stream))
         .route("/api/media/info", get(api_media_info))
         .route("/api/audio/meta", get(api_audio_meta))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            refresh_session_cookie,
+        ));
+
+    Router::new()
+        .merge(api)
         .route("/", get(static_index))
         .route("/{*path}", get(static_asset))
         .layer(CompressionLayer::new())
         .with_state(state)
 }
 
-fn session_from(headers: &HeaderMap, auth: &AuthState) -> Option<Session> {
-    if !auth.requires_auth() {
-        return None;
+/// Slide the browser cookie whenever a live session is seen, so Max-Age does
+/// not strand an active user after the original login age.
+async fn refresh_session_cookie(
+    State(st): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let sid = cookie_sid(req.headers()).filter(|_| st.auth.requires_auth());
+    let mut res = next.run(req).await;
+    // Don't override an explicit logout / login Set-Cookie.
+    if res.headers().contains_key(header::SET_COOKIE) {
+        return res;
     }
+    if let Some(sid) = sid {
+        if st.auth.get(&sid).is_some() {
+            if let Ok(val) = HeaderValue::from_str(&session_cookie_value(&sid, st.auth.ttl_secs()))
+            {
+                res.headers_mut().insert(header::SET_COOKIE, val);
+            }
+        }
+    }
+    res
+}
+
+fn cookie_sid(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in cookie.split(';') {
         let part = part.trim();
         if let Some(v) = part.strip_prefix(&format!("{SESSION_COOKIE}=")) {
-            return auth.get(v);
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
         }
+    }
+    None
+}
+
+fn session_from(headers: &HeaderMap, auth: &AuthState) -> Option<Session> {
+    if !auth.requires_auth() {
+        return None;
+    }
+    if let Some(sid) = cookie_sid(headers) {
+        return auth.get(&sid);
     }
     if let Some(authz) = headers.get(header::AUTHORIZATION) {
         if let Ok(s) = authz.to_str() {
@@ -119,10 +163,7 @@ struct LoginReq {
 async fn api_login(State(st): State<AppState>, Json(body): Json<LoginReq>) -> Response {
     match st.auth.login(&body.username, &body.password) {
         Ok(sess) => {
-            let cookie = format!(
-                "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-                sess.id, st.cfg.session.ttl_secs
-            );
+            let cookie = session_cookie_value(&sess.id, st.auth.ttl_secs());
             (
                 StatusCode::OK,
                 [(header::SET_COOKIE, cookie)],
@@ -150,10 +191,9 @@ async fn api_logout(State(st): State<AppState>, headers: HeaderMap) -> Response 
     if let Some(s) = session_from(&headers, &st.auth) {
         st.auth.logout(&s.id);
     }
-    let cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0");
     (
         StatusCode::OK,
-        [(header::SET_COOKIE, cookie)],
+        [(header::SET_COOKIE, clear_session_cookie())],
         Json(serde_json::json!({"ok": true})),
     )
         .into_response()

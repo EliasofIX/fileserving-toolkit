@@ -37,7 +37,9 @@ role = "admin"
 # role = "user"
 
 [session]
-# Session lifetime in seconds (default 7 days)
+# Idle lifetime in seconds (default 7 days). Each authenticated request slides
+# this window. Sessions are saved under data_dir/sessions/ so restarts keep you
+# logged in until idle expiry (or logout).
 ttl_secs = 604800
 
 [transfer]

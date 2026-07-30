@@ -650,3 +650,55 @@ pub fn seal_uploaded_file(
 pub fn keystore_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("keystore")
 }
+
+pub fn sessions_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("sessions")
+}
+
+/// AES-256-GCM seal: returns nonce || ciphertext.
+pub fn seal_with_key(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::Msg(e.to_string()))?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .map_err(|e| CryptoError::Msg(e.to_string()))?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Open a blob produced by [`seal_with_key`].
+pub fn open_with_key(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    if blob.len() < 12 + TAG_LEN {
+        return Err(CryptoError::Msg("corrupt sealed blob".into()));
+    }
+    let (nonce, ct) = blob.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::Msg(e.to_string()))?;
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ct)
+        .map_err(|_| CryptoError::Msg("session seal open failed".into()))
+}
+
+/// Load or create the server-local key used to wrap session secrets on disk.
+pub fn load_or_create_session_seal_key(keystore: &Path) -> Result<[u8; 32], CryptoError> {
+    std::fs::create_dir_all(keystore)?;
+    let path = keystore.join("session-seal.key");
+    if path.exists() {
+        let raw = std::fs::read(&path)?;
+        let key: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| CryptoError::Msg("bad session-seal.key length".into()))?;
+        return Ok(key);
+    }
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    std::fs::write(&path, key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(key)
+}
