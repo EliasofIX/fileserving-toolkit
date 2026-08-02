@@ -1,6 +1,8 @@
 //! HTTP API + static UI serving.
 
-use crate::auth::{AuthState, Session, SESSION_COOKIE};
+use crate::auth::{
+    clear_session_cookie, session_cookie_value, AuthState, Session, SESSION_COOKIE,
+};
 use crate::config::Config;
 use crate::crypto;
 use crate::media::Media;
@@ -12,6 +14,7 @@ use axum::http::{
     header::{self, HeaderMap, HeaderValue},
     StatusCode,
 };
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -35,7 +38,7 @@ pub struct AppState {
 struct Assets;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/login", post(api_login))
         .route("/api/logout", post(api_logout))
@@ -50,22 +53,69 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stream", get(api_stream))
         .route("/api/media/info", get(api_media_info))
         .route("/api/audio/meta", get(api_audio_meta))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            refresh_session_cookie,
+        ));
+
+    Router::new()
+        .merge(api)
         .route("/", get(static_index))
         .route("/{*path}", get(static_asset))
         .layer(CompressionLayer::new())
         .with_state(state)
 }
 
-fn session_from(headers: &HeaderMap, auth: &AuthState) -> Option<Session> {
-    if !auth.requires_auth() {
-        return None;
+/// Refresh the browser cookie Max-Age when a live session is present.
+/// Uses peek() so we do not double-slide / double-persist after handlers.
+async fn refresh_session_cookie(
+    State(st): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let sid = cookie_sid(req.headers()).filter(|_| st.auth.requires_auth());
+    let mut res = next.run(req).await;
+    // Don't override an explicit logout / login Set-Cookie.
+    if res.headers().contains_key(header::SET_COOKIE) {
+        return res;
     }
+    if let Some(sid) = sid {
+        if st.auth.peek(&sid).is_some() {
+            if let Ok(val) = HeaderValue::from_str(&session_cookie_value(
+                &sid,
+                st.auth.ttl_secs(),
+                st.auth.secure_cookie(),
+            )) {
+                res.headers_mut().insert(header::SET_COOKIE, val);
+            }
+        }
+    }
+    res
+}
+
+fn cookie_sid(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in cookie.split(';') {
         let part = part.trim();
         if let Some(v) = part.strip_prefix(&format!("{SESSION_COOKIE}=")) {
-            return auth.get(v);
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
         }
+    }
+    None
+}
+
+fn session_from(headers: &HeaderMap, auth: &AuthState) -> Option<Session> {
+    if !auth.requires_auth() {
+        return None;
+    }
+    if let Some(sid) = cookie_sid(headers) {
+        if let Some(s) = auth.get(&sid) {
+            return Some(s);
+        }
+        // Stale/invalid cookie must not block a valid Bearer token.
     }
     if let Some(authz) = headers.get(header::AUTHORIZATION) {
         if let Ok(s) = authz.to_str() {
@@ -119,9 +169,10 @@ struct LoginReq {
 async fn api_login(State(st): State<AppState>, Json(body): Json<LoginReq>) -> Response {
     match st.auth.login(&body.username, &body.password) {
         Ok(sess) => {
-            let cookie = format!(
-                "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-                sess.id, st.cfg.session.ttl_secs
+            let cookie = session_cookie_value(
+                &sess.id,
+                st.auth.ttl_secs(),
+                st.auth.secure_cookie(),
             );
             (
                 StatusCode::OK,
@@ -138,11 +189,24 @@ async fn api_login(State(st): State<AppState>, Json(body): Json<LoginReq>) -> Re
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
+        Err(e) => {
+            // Avoid leaking internal seal-key / IO details to clients.
+            let public = if e == "invalid credentials"
+                || e.starts_with("user has no password hash")
+                || e == "auth disabled"
+                || e == "login unavailable"
+            {
+                e
+            } else {
+                tracing::warn!("login failed: {e}");
+                "invalid credentials".into()
+            };
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": public})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -150,10 +214,12 @@ async fn api_logout(State(st): State<AppState>, headers: HeaderMap) -> Response 
     if let Some(s) = session_from(&headers, &st.auth) {
         st.auth.logout(&s.id);
     }
-    let cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0");
     (
         StatusCode::OK,
-        [(header::SET_COOKIE, cookie)],
+        [(
+            header::SET_COOKIE,
+            clear_session_cookie(st.auth.secure_cookie()),
+        )],
         Json(serde_json::json!({"ok": true})),
     )
         .into_response()

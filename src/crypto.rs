@@ -114,7 +114,7 @@ fn decode_dk(bytes: &[u8]) -> Result<Dk, CryptoError> {
 
 /// Generate ML-KEM-768 keypair; seal secret with password-derived key.
 pub fn create_user_keystore(username: &str, password: &str, dir: &Path) -> Result<(), CryptoError> {
-    std::fs::create_dir_all(dir)?;
+    ensure_private_dir(dir)?;
     let (dk, ek) = MlKem768::generate(&mut OsRng);
     let kek = kdf_password(password, username)?;
     let cipher = Aes256Gcm::new_from_slice(&kek).map_err(|e| CryptoError::Msg(e.to_string()))?;
@@ -127,12 +127,12 @@ pub fn create_user_keystore(username: &str, password: &str, dir: &Path) -> Resul
 
     let ek_path = dir.join(format!("{username}.ek"));
     let sk_path = dir.join(format!("{username}.sk"));
-    std::fs::write(&ek_path, encode_ek(&ek))?;
+    write_private_file(&ek_path, &encode_ek(&ek))?;
     // sk file: nonce || ciphertext
     let mut sk_blob = Vec::with_capacity(12 + ct.len());
     sk_blob.extend_from_slice(&nonce);
     sk_blob.extend_from_slice(&ct);
-    std::fs::write(&sk_path, &sk_blob)?;
+    write_private_file(&sk_path, &sk_blob)?;
     Ok(())
 }
 
@@ -649,4 +649,107 @@ pub fn seal_uploaded_file(
 
 pub fn keystore_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("keystore")
+}
+
+pub fn sessions_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("sessions")
+}
+
+/// AES-256-GCM seal with AAD: returns nonce || ciphertext.
+pub fn seal_with_key_aad(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    use aes_gcm::aead::Payload;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::Msg(e.to_string()))?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| CryptoError::Msg(e.to_string()))?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Open a blob produced by [`seal_with_key_aad`].
+pub fn open_with_key_aad(
+    key: &[u8; 32],
+    blob: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    use aes_gcm::aead::Payload;
+    if blob.len() < 12 + TAG_LEN {
+        return Err(CryptoError::Msg("corrupt sealed blob".into()));
+    }
+    let (nonce, ct) = blob.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::Msg(e.to_string()))?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload { msg: ct, aad },
+        )
+        .map_err(|_| CryptoError::Msg("session seal open failed".into()))
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), CryptoError> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+/// Write `data` creating/truncating `path` with mode 0600 on Unix (no world-readable window).
+pub fn write_private_file(path: &Path, data: &[u8]) -> Result<(), CryptoError> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)?;
+        Ok(())
+    }
+}
+
+/// Load or create the server-local key used to wrap session secrets on disk.
+pub fn load_or_create_session_seal_key(keystore: &Path) -> Result<[u8; 32], CryptoError> {
+    ensure_private_dir(keystore)?;
+    let path = keystore.join("session-seal.key");
+    if path.exists() {
+        let raw = std::fs::read(&path)?;
+        let key: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| CryptoError::Msg("bad session-seal.key length".into()))?;
+        return Ok(key);
+    }
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    write_private_file(&path, &key)?;
+    Ok(key)
+}
+
+pub fn ensure_sessions_dir(dir: &Path) -> Result<(), CryptoError> {
+    ensure_private_dir(dir)
 }

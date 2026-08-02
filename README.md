@@ -62,6 +62,10 @@ Large transfers open the **Transfer Dial** UI.
 
 Optional `ffmpeg` / `ffprobe` for remux when the browser cannot play a container/codec natively. Leave paths empty / missing binaries to disable — zero cost when idle.
 
+## Sessions
+
+When encryption is on, login issues an HttpOnly cookie. Sessions are stored under `data/sessions/` (secrets sealed with `data/keystore/session-seal.key`, metadata bound as AES-GCM AAD) so a server restart does not force re-login. The idle TTL in `[session] ttl_secs` slides on each authenticated request; logout or idle expiry clears the session. Set `secure_cookie = true` behind HTTPS.
+
 ## Idle cost
 
 Release binary, 2 tokio workers by default, no background polls except hourly session/upload GC. No database.
