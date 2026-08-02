@@ -263,8 +263,10 @@ impl AuthState {
         if SystemTime::now() > s.expires {
             return None;
         }
-        // Drop sessions for users removed from config.
-        if !self.users.iter().any(|u| u.username == s.username) {
+        let user = self.users.iter().find(|u| u.username == s.username)?;
+        let live_cred = cred_fingerprint(&user.password_hash);
+        let live_ks = keystore_fingerprint(&s.username, &self.keystore);
+        if s.cred_fp != live_cred || s.keystore_fp != live_ks {
             return None;
         }
         Some(s)
