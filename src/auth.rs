@@ -289,7 +289,20 @@ impl AuthState {
         let mut map = self.sessions.write();
         let expired: Vec<String> = map
             .iter()
-            .filter(|(_, s)| s.expires <= now)
+            .filter(|(_, s)| {
+                if s.expires <= now {
+                    return true;
+                }
+                // Also drop sessions whose password/keystore rotated while idle.
+                match self.users.iter().find(|u| u.username == s.username) {
+                    None => true,
+                    Some(u) => {
+                        let cred = cred_fingerprint(&u.password_hash);
+                        let ks = keystore_fingerprint(&s.username, &self.keystore);
+                        s.cred_fp != cred || s.keystore_fp != ks
+                    }
+                }
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &expired {
