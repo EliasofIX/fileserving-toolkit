@@ -46,6 +46,9 @@ pub struct Session {
     /// Unlocked ML-KEM decapsulation key for this user.
     pub secrets: Arc<UserSecrets>,
     pub expires: SystemTime,
+    /// Fingerprints captured at login/restore; mismatch → invalidate (no rebind).
+    cred_fp: String,
+    keystore_fp: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -182,11 +185,13 @@ impl AuthState {
             role: Role::parse(&user.role),
             secrets: Arc::new(secrets),
             expires: SystemTime::now() + self.ttl,
+            cred_fp: cred_fingerprint(&user.password_hash),
+            keystore_fp: keystore_fingerprint(username, ks),
         };
 
         let mut map = self.sessions.write();
         // Persist before eviction so a failed write cannot wipe sibling sessions.
-        self.persist_locked(&session, &user.password_hash)?;
+        self.persist_locked(&session)?;
         map.insert(id.clone(), session.clone());
         // Never evict the session we just issued (equal expiries / races).
         self.evict_overflow_locked(&mut map, username, self.max_per_user, Some(&id));
@@ -225,13 +230,22 @@ impl AuthState {
             self.remove_persisted_path(&self.session_tmp_path(sid));
             return None;
         };
+        // Password / keystore rotation while the process is up must kill the
+        // session — never re-seal the old DK under a new fingerprint.
+        let live_cred = cred_fingerprint(&user.password_hash);
+        let live_ks = keystore_fingerprint(&s.username, &self.keystore);
+        if s.cred_fp != live_cred || s.keystore_fp != live_ks {
+            map.remove(sid);
+            self.remove_persisted_path(&self.session_path(sid));
+            self.remove_persisted_path(&self.session_tmp_path(sid));
+            return None;
+        }
         let role = Role::parse(&user.role);
-        let password_hash = user.password_hash.clone();
         if let Some(s2) = map.get_mut(sid) {
             s2.expires = SystemTime::now() + self.ttl;
             s2.role = role;
             let refreshed = s2.clone();
-            if let Err(e) = self.persist_locked(&refreshed, &password_hash) {
+            if let Err(e) = self.persist_locked(&refreshed) {
                 tracing::warn!("session persist failed for {sid}: {e}");
             }
             return Some(refreshed);
@@ -440,11 +454,14 @@ impl AuthState {
             role: Role::parse(&user.role),
             secrets: Arc::new(UserSecrets { kem_dk }),
             expires: unix_to_system(ps.expires_unix),
+            cred_fp: cred,
+            keystore_fp: ks_fp,
         })
     }
 
     /// Persist while caller holds the sessions write lock.
-    fn persist_locked(&self, session: &Session, password_hash: &str) -> Result<(), String> {
+    /// Uses the fingerprints frozen on the Session (never rebind to a rotated keystore).
+    fn persist_locked(&self, session: &Session) -> Result<(), String> {
         if !is_valid_session_id(&session.id) {
             return Err("invalid session id".into());
         }
@@ -454,15 +471,13 @@ impl AuthState {
         crypto::ensure_sessions_dir(&self.session_dir).map_err(|e| e.to_string())?;
         let expires_unix = system_to_unix(session.expires);
         let role = session.role.as_str();
-        let cred = cred_fingerprint(password_hash);
-        let ks_fp = keystore_fingerprint(&session.username, &self.keystore);
         let aad = session_aad(
             &session.id,
             &session.username,
             role,
             expires_unix,
-            &cred,
-            &ks_fp,
+            &session.cred_fp,
+            &session.keystore_fp,
         );
         let sealed = crypto::seal_with_key_aad(&key, &session.secrets.kem_dk, aad.as_bytes())
             .map_err(|e| e.to_string())?;
@@ -762,6 +777,29 @@ mod tests {
         crypto::create_user_keystore("admin", "secret", &crypto::keystore_dir(&dir)).unwrap();
         let auth2 = AuthState::new(&cfg);
         assert!(auth2.get(&sid).is_none(), "init-keys must invalidate sessions");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_keystore_rotation_kills_session_without_rebind() {
+        let dir = std::env::temp_dir().join(format!("fst-liveks-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = temp_cfg(&dir);
+        cfg.ensure_dirs().unwrap();
+
+        let auth = AuthState::new(&cfg);
+        let sess = auth.login("admin", "secret").unwrap();
+        let sid = sess.id.clone();
+        crypto::create_user_keystore("admin", "secret", &crypto::keystore_dir(&dir)).unwrap();
+        assert!(
+            auth.get(&sid).is_none(),
+            "live init-keys must not re-seal old DK under new fingerprint"
+        );
+        drop(auth);
+        let auth2 = AuthState::new(&cfg);
+        assert!(auth2.get(&sid).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
