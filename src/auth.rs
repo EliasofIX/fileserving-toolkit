@@ -185,9 +185,10 @@ impl AuthState {
         };
 
         let mut map = self.sessions.write();
-        self.evict_overflow_locked(&mut map, username, self.max_per_user.saturating_sub(1));
-        self.persist_locked(&session)?;
+        // Persist before eviction so a failed write cannot wipe sibling sessions.
+        self.persist_locked(&session, &user.password_hash)?;
         map.insert(id, session.clone());
+        self.evict_overflow_locked(&mut map, username, self.max_per_user);
         Ok(session)
     }
 
@@ -217,13 +218,19 @@ impl AuthState {
             return None;
         }
         // Re-bind role from live config (demotions / removals take effect).
-        let user = self.users.iter().find(|u| u.username == s.username)?;
+        let Some(user) = self.users.iter().find(|u| u.username == s.username) else {
+            map.remove(sid);
+            self.remove_persisted_path(&self.session_path(sid));
+            self.remove_persisted_path(&self.session_tmp_path(sid));
+            return None;
+        };
         let role = Role::parse(&user.role);
+        let password_hash = user.password_hash.clone();
         if let Some(s2) = map.get_mut(sid) {
             s2.expires = SystemTime::now() + self.ttl;
             s2.role = role;
             let refreshed = s2.clone();
-            if let Err(e) = self.persist_locked(&refreshed) {
+            if let Err(e) = self.persist_locked(&refreshed, &password_hash) {
                 tracing::warn!("session persist failed for {sid}: {e}");
             }
             return Some(refreshed);
@@ -374,6 +381,20 @@ impl AuthState {
                 }
             }
         }
+        // Enforce per-user caps after restore (config may have been tightened).
+        {
+            let mut map = self.sessions.write();
+            let users: Vec<String> = map
+                .values()
+                .map(|s| s.username.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            for u in users {
+                self.evict_overflow_locked(&mut map, &u, self.max_per_user);
+            }
+            loaded = map.len();
+        }
         if loaded > 0 {
             tracing::info!("restored {loaded} login session(s)");
         }
@@ -397,9 +418,10 @@ impl AuthState {
             .iter()
             .find(|u| u.username == ps.username)
             .ok_or_else(|| "unknown user".to_string())?;
-        // Role always comes from live config, but AAD still uses the sealed
-        // role string so tampering with JSON role/expiry/username fails open.
-        let aad = session_aad(&ps.id, &ps.username, &ps.role, ps.expires_unix);
+        // Role always comes from live config. AAD binds sealed role + credential
+        // fingerprint so JSON tampering or password rotation invalidates the blob.
+        let cred = cred_fingerprint(&user.password_hash);
+        let aad = session_aad(&ps.id, &ps.username, &ps.role, ps.expires_unix, &cred);
         let blob = B64.decode(&ps.secrets_blob).map_err(|e| e.to_string())?;
         let kem_dk =
             crypto::open_with_key_aad(&key, &blob, aad.as_bytes()).map_err(|e| e.to_string())?;
@@ -413,7 +435,7 @@ impl AuthState {
     }
 
     /// Persist while caller holds the sessions write lock.
-    fn persist_locked(&self, session: &Session) -> Result<(), String> {
+    fn persist_locked(&self, session: &Session, password_hash: &str) -> Result<(), String> {
         if !is_valid_session_id(&session.id) {
             return Err("invalid session id".into());
         }
@@ -423,7 +445,14 @@ impl AuthState {
         crypto::ensure_sessions_dir(&self.session_dir).map_err(|e| e.to_string())?;
         let expires_unix = system_to_unix(session.expires);
         let role = session.role.as_str();
-        let aad = session_aad(&session.id, &session.username, role, expires_unix);
+        let cred = cred_fingerprint(password_hash);
+        let aad = session_aad(
+            &session.id,
+            &session.username,
+            role,
+            expires_unix,
+            &cred,
+        );
         let sealed = crypto::seal_with_key_aad(&key, &session.secrets.kem_dk, aad.as_bytes())
             .map_err(|e| e.to_string())?;
         let ps = PersistedSession {
@@ -482,8 +511,21 @@ impl AuthState {
     }
 }
 
-fn session_aad(id: &str, username: &str, role: &str, expires_unix: u64) -> String {
-    format!("fst-sess-v1|{id}|{username}|{role}|{expires_unix}")
+fn session_aad(
+    id: &str,
+    username: &str,
+    role: &str,
+    expires_unix: u64,
+    cred_fp: &str,
+) -> String {
+    format!("fst-sess-v2|{id}|{username}|{role}|{expires_unix}|{cred_fp}")
+}
+
+/// Short fingerprint of the configured password hash so rotation invalidates sessions.
+fn cred_fingerprint(password_hash: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let dig = Sha256::digest(password_hash.as_bytes());
+    hex::encode(&dig[..16])
 }
 
 fn is_valid_session_id(id: &str) -> bool {
@@ -648,6 +690,29 @@ mod tests {
         assert!(!is_valid_session_id("../keystore/evil"));
         assert!(!is_valid_session_id(""));
         assert!(is_valid_session_id(&Uuid::new_v4().to_string()));
+    }
+
+    #[test]
+    fn password_rotation_invalidates_sessions() {
+        let dir = std::env::temp_dir().join(format!("fst-pwrot-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = temp_cfg(&dir);
+        cfg.ensure_dirs().unwrap();
+
+        let auth1 = AuthState::new(&cfg);
+        let sess = auth1.login("admin", "secret").unwrap();
+        let sid = sess.id.clone();
+        drop(auth1);
+
+        cfg.auth.users[0].password_hash = crypto::hash_password("new-secret").unwrap();
+        let auth2 = AuthState::new(&cfg);
+        assert!(
+            auth2.get(&sid).is_none(),
+            "sessions must die when password_hash changes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

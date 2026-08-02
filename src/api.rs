@@ -112,7 +112,10 @@ fn session_from(headers: &HeaderMap, auth: &AuthState) -> Option<Session> {
         return None;
     }
     if let Some(sid) = cookie_sid(headers) {
-        return auth.get(&sid);
+        if let Some(s) = auth.get(&sid) {
+            return Some(s);
+        }
+        // Stale/invalid cookie must not block a valid Bearer token.
     }
     if let Some(authz) = headers.get(header::AUTHORIZATION) {
         if let Ok(s) = authz.to_str() {

@@ -114,7 +114,7 @@ fn decode_dk(bytes: &[u8]) -> Result<Dk, CryptoError> {
 
 /// Generate ML-KEM-768 keypair; seal secret with password-derived key.
 pub fn create_user_keystore(username: &str, password: &str, dir: &Path) -> Result<(), CryptoError> {
-    std::fs::create_dir_all(dir)?;
+    ensure_private_dir(dir)?;
     let (dk, ek) = MlKem768::generate(&mut OsRng);
     let kek = kdf_password(password, username)?;
     let cipher = Aes256Gcm::new_from_slice(&kek).map_err(|e| CryptoError::Msg(e.to_string()))?;
@@ -127,12 +127,12 @@ pub fn create_user_keystore(username: &str, password: &str, dir: &Path) -> Resul
 
     let ek_path = dir.join(format!("{username}.ek"));
     let sk_path = dir.join(format!("{username}.sk"));
-    std::fs::write(&ek_path, encode_ek(&ek))?;
+    write_private_file(&ek_path, &encode_ek(&ek))?;
     // sk file: nonce || ciphertext
     let mut sk_blob = Vec::with_capacity(12 + ct.len());
     sk_blob.extend_from_slice(&nonce);
     sk_blob.extend_from_slice(&ct);
-    std::fs::write(&sk_path, &sk_blob)?;
+    write_private_file(&sk_path, &sk_blob)?;
     Ok(())
 }
 
