@@ -66,8 +66,8 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Slide the browser cookie whenever a live session is seen, so Max-Age does
-/// not strand an active user after the original login age.
+/// Refresh the browser cookie Max-Age when a live session is present.
+/// Uses peek() so we do not double-slide / double-persist after handlers.
 async fn refresh_session_cookie(
     State(st): State<AppState>,
     req: Request,
@@ -80,9 +80,12 @@ async fn refresh_session_cookie(
         return res;
     }
     if let Some(sid) = sid {
-        if st.auth.get(&sid).is_some() {
-            if let Ok(val) = HeaderValue::from_str(&session_cookie_value(&sid, st.auth.ttl_secs()))
-            {
+        if st.auth.peek(&sid).is_some() {
+            if let Ok(val) = HeaderValue::from_str(&session_cookie_value(
+                &sid,
+                st.auth.ttl_secs(),
+                st.auth.secure_cookie(),
+            )) {
                 res.headers_mut().insert(header::SET_COOKIE, val);
             }
         }
@@ -163,7 +166,11 @@ struct LoginReq {
 async fn api_login(State(st): State<AppState>, Json(body): Json<LoginReq>) -> Response {
     match st.auth.login(&body.username, &body.password) {
         Ok(sess) => {
-            let cookie = session_cookie_value(&sess.id, st.auth.ttl_secs());
+            let cookie = session_cookie_value(
+                &sess.id,
+                st.auth.ttl_secs(),
+                st.auth.secure_cookie(),
+            );
             (
                 StatusCode::OK,
                 [(header::SET_COOKIE, cookie)],
@@ -179,11 +186,24 @@ async fn api_login(State(st): State<AppState>, Json(body): Json<LoginReq>) -> Re
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
+        Err(e) => {
+            // Avoid leaking internal seal-key / IO details to clients.
+            let public = if e == "invalid credentials"
+                || e.starts_with("user has no password hash")
+                || e == "auth disabled"
+                || e == "login unavailable"
+            {
+                e
+            } else {
+                tracing::warn!("login failed: {e}");
+                "invalid credentials".into()
+            };
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": public})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -193,7 +213,10 @@ async fn api_logout(State(st): State<AppState>, headers: HeaderMap) -> Response 
     }
     (
         StatusCode::OK,
-        [(header::SET_COOKIE, clear_session_cookie())],
+        [(
+            header::SET_COOKIE,
+            clear_session_cookie(st.auth.secure_cookie()),
+        )],
         Json(serde_json::json!({"ok": true})),
     )
         .into_response()

@@ -41,6 +41,10 @@ role = "admin"
 # this window. Sessions are saved under data_dir/sessions/ so restarts keep you
 # logged in until idle expiry (or logout).
 ttl_secs = 604800
+# Set true when serving over HTTPS (or behind a TLS terminator).
+secure_cookie = false
+# Max concurrent sessions per user; oldest revoked on new login.
+max_per_user = 8
 
 [transfer]
 # Read/write buffer size for streaming (bytes). 8 MiB is a good default.

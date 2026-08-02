@@ -64,18 +64,30 @@ fn default_role() -> String {
 pub struct SessionConfig {
     #[serde(default = "default_ttl")]
     pub ttl_secs: u64,
+    /// Set Secure on the session cookie (use behind HTTPS / TLS terminator).
+    #[serde(default)]
+    pub secure_cookie: bool,
+    /// Max concurrent persisted sessions per user (oldest revoked on login).
+    #[serde(default = "default_max_sessions_per_user")]
+    pub max_per_user: usize,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             ttl_secs: default_ttl(),
+            secure_cookie: false,
+            max_per_user: default_max_sessions_per_user(),
         }
     }
 }
 
 fn default_ttl() -> u64 {
     604_800
+}
+
+fn default_max_sessions_per_user() -> usize {
+    8
 }
 
 #[derive(Debug, Clone, Deserialize)]

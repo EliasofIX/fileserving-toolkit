@@ -3,11 +3,12 @@
 //! Sessions are persisted under `{data_dir}/sessions/` so a process restart
 //! does not force re-login. User ML-KEM secrets are sealed with a server-local
 //! key (`keystore/session-seal.key`) — same trust boundary as the data dir.
+//! Session metadata (id, username, role, expiry) is bound as AES-GCM AAD.
 
 use crate::config::{Config, UserConfig};
 use crate::crypto::{self, UserSecrets};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,7 +54,7 @@ struct PersistedSession {
     username: String,
     role: String,
     expires_unix: u64,
-    /// base64(nonce || ciphertext) of kem_dk under session seal key
+    /// base64(nonce || ciphertext) of kem_dk; AAD binds id|username|role|expires
     secrets_blob: String,
 }
 
@@ -63,8 +64,10 @@ pub struct AuthState {
     users: Vec<UserConfig>,
     keystore: PathBuf,
     session_dir: PathBuf,
-    seal_key: [u8; 32],
+    seal_key: Option<[u8; 32]>,
     encryption: bool,
+    secure_cookie: bool,
+    max_per_user: usize,
     /// Unlocked at boot via FST_SHARED_PASSWORD when encryption is on.
     shared_secrets: RwLock<Option<Arc<UserSecrets>>>,
 }
@@ -73,14 +76,24 @@ impl AuthState {
     pub fn new(cfg: &Config) -> Self {
         let keystore = crypto::keystore_dir(&cfg.server.data_dir);
         let session_dir = crypto::sessions_dir(&cfg.server.data_dir);
+
         let seal_key = if cfg.encryption.enabled {
-            let _ = std::fs::create_dir_all(&session_dir);
-            crypto::load_or_create_session_seal_key(&keystore).unwrap_or_else(|e| {
-                tracing::error!("session seal key: {e}");
-                [0u8; 32]
-            })
+            if let Err(e) = crypto::ensure_sessions_dir(&session_dir) {
+                tracing::error!("sessions dir: {e}");
+            }
+            match crypto::load_or_create_session_seal_key(&keystore) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    // Do not substitute a zero key and wipe sessions — leave
+                    // files untouched and refuse to persist until fixed.
+                    tracing::error!(
+                        "session seal key unavailable ({e}); persisted logins disabled"
+                    );
+                    None
+                }
+            }
         } else {
-            [0u8; 32]
+            None
         };
 
         let this = Self {
@@ -91,11 +104,17 @@ impl AuthState {
             session_dir,
             seal_key,
             encryption: cfg.encryption.enabled,
+            secure_cookie: cfg.session.secure_cookie,
+            max_per_user: cfg.session.max_per_user.max(1),
             shared_secrets: RwLock::new(None),
         };
 
         if cfg.encryption.enabled {
-            this.load_persisted();
+            if this.seal_key.is_some() {
+                this.load_persisted();
+            } else {
+                tracing::warn!("skipping session restore — seal key not loaded");
+            }
         }
         this
     }
@@ -106,6 +125,10 @@ impl AuthState {
 
     pub fn ttl_secs(&self) -> u64 {
         self.ttl.as_secs()
+    }
+
+    pub fn secure_cookie(&self) -> bool {
+        self.secure_cookie
     }
 
     pub fn keystore_path(&self) -> &PathBuf {
@@ -123,6 +146,10 @@ impl AuthState {
     pub fn login(&self, username: &str, password: &str) -> Result<Session, String> {
         if !self.encryption {
             return Err("auth disabled".into());
+        }
+        if self.seal_key.is_none() {
+            tracing::error!("login refused: session seal key unavailable");
+            return Err("login unavailable".into());
         }
         let user = self
             .users
@@ -156,31 +183,67 @@ impl AuthState {
             secrets: Arc::new(secrets),
             expires: SystemTime::now() + self.ttl,
         };
-        self.persist(&session)?;
-        self.sessions.write().insert(id, session.clone());
+
+        let mut map = self.sessions.write();
+        self.evict_overflow_locked(&mut map, username, self.max_per_user.saturating_sub(1));
+        self.persist_locked(&session)?;
+        map.insert(id, session.clone());
         Ok(session)
     }
 
     pub fn logout(&self, sid: &str) {
-        self.sessions.write().remove(sid);
-        self.remove_persisted(sid);
+        if !is_valid_session_id(sid) {
+            return;
+        }
+        let mut map = self.sessions.write();
+        map.remove(sid);
+        // Delete while holding the write lock so a concurrent get()/persist
+        // cannot resurrect the file after logout.
+        self.remove_persisted_path(&self.session_path(sid));
+        self.remove_persisted_path(&self.session_tmp_path(sid));
     }
 
+    /// Validate session and slide idle TTL (persists under the session lock).
     pub fn get(&self, sid: &str) -> Option<Session> {
+        if !is_valid_session_id(sid) {
+            return None;
+        }
         let mut map = self.sessions.write();
         let s = map.get(sid)?.clone();
         if SystemTime::now() > s.expires {
             map.remove(sid);
-            drop(map);
-            self.remove_persisted(sid);
+            self.remove_persisted_path(&self.session_path(sid));
+            self.remove_persisted_path(&self.session_tmp_path(sid));
             return None;
         }
+        // Re-bind role from live config (demotions / removals take effect).
+        let user = self.users.iter().find(|u| u.username == s.username)?;
+        let role = Role::parse(&user.role);
         if let Some(s2) = map.get_mut(sid) {
             s2.expires = SystemTime::now() + self.ttl;
+            s2.role = role;
             let refreshed = s2.clone();
-            drop(map);
-            let _ = self.persist(&refreshed);
+            if let Err(e) = self.persist_locked(&refreshed) {
+                tracing::warn!("session persist failed for {sid}: {e}");
+            }
             return Some(refreshed);
+        }
+        Some(s)
+    }
+
+    /// Check session without sliding TTL or touching disk (for cookie refresh).
+    pub fn peek(&self, sid: &str) -> Option<Session> {
+        if !is_valid_session_id(sid) {
+            return None;
+        }
+        let map = self.sessions.read();
+        let s = map.get(sid)?.clone();
+        if SystemTime::now() > s.expires {
+            return None;
+        }
+        // Drop sessions for users removed from config.
+        if !self.users.iter().any(|u| u.username == s.username) {
+            return None;
         }
         Some(s)
     }
@@ -195,24 +258,40 @@ impl AuthState {
             .collect();
         for id in &expired {
             map.remove(id);
+            self.remove_persisted_path(&self.session_path(id));
+            self.remove_persisted_path(&self.session_tmp_path(id));
         }
+        // Sweep orphan disk files. Never remove a live in-memory session
+        // based solely on a stale on-disk expiry.
+        let live: std::collections::HashSet<String> = map.keys().cloned().collect();
         drop(map);
-        for id in expired {
-            self.remove_persisted(&id);
-        }
-        // Also sweep orphan files (e.g. from a crash mid-write).
         if let Ok(rd) = std::fs::read_dir(&self.session_dir) {
             for ent in rd.flatten() {
                 let p = ent.path();
                 if p.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
-                if let Ok(raw) = std::fs::read_to_string(&p) {
-                    if let Ok(ps) = serde_json::from_str::<PersistedSession>(&raw) {
-                        if unix_to_system(ps.expires_unix) <= now {
-                            let _ = std::fs::remove_file(&p);
-                            self.sessions.write().remove(&ps.id);
-                        }
+                let stem = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if live.contains(stem) {
+                    continue;
+                }
+                if !is_valid_session_id(stem) {
+                    let _ = std::fs::remove_file(&p);
+                    continue;
+                }
+                match self.decode_persisted_file(&p) {
+                    Ok(ps) if unix_to_system(ps.expires_unix) <= now => {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                    Ok(_) => {
+                        // Unexpired orphan (e.g. crash after write before map
+                        // insert) — leave for next boot restore.
+                    }
+                    Err(_) => {
+                        let _ = std::fs::remove_file(&p);
                     }
                 }
             }
@@ -262,19 +341,36 @@ impl AuthState {
             if p.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            match self.read_persisted_file(&p) {
+            let stem = match p.file_stem().and_then(|s| s.to_str()) {
+                Some(s) if is_valid_session_id(s) => s.to_string(),
+                _ => {
+                    tracing::warn!("removing invalid session filename {}", p.display());
+                    let _ = std::fs::remove_file(&p);
+                    continue;
+                }
+            };
+            match self.read_persisted_file(&p, &stem) {
                 Ok(session) if session.expires > now => {
                     self.sessions
                         .write()
                         .insert(session.id.clone(), session);
                     loaded += 1;
                 }
-                Ok(session) => {
-                    self.remove_persisted(&session.id);
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&p);
                 }
                 Err(e) => {
+                    // Auth failures (bad AAD / wrong key material) delete the
+                    // file; IO errors on an otherwise valid seal key leave it.
                     tracing::warn!("skipping session {}: {e}", p.display());
-                    let _ = std::fs::remove_file(&p);
+                    if e.contains("seal open")
+                        || e.contains("aad")
+                        || e.contains("unknown user")
+                        || e.contains("id mismatch")
+                        || e.contains("invalid session")
+                    {
+                        let _ = std::fs::remove_file(&p);
+                    }
                 }
             }
         }
@@ -283,38 +379,64 @@ impl AuthState {
         }
     }
 
-    fn read_persisted_file(&self, path: &Path) -> Result<Session, String> {
+    fn decode_persisted_file(&self, path: &Path) -> Result<PersistedSession, String> {
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let ps: PersistedSession = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).map_err(|e| e.to_string())
+    }
+
+    fn read_persisted_file(&self, path: &Path, file_stem: &str) -> Result<Session, String> {
+        let key = self
+            .seal_key
+            .ok_or_else(|| "seal key unavailable".to_string())?;
+        let ps = self.decode_persisted_file(path)?;
+        if ps.id != file_stem || !is_valid_session_id(&ps.id) {
+            return Err("id mismatch".into());
+        }
+        let user = self
+            .users
+            .iter()
+            .find(|u| u.username == ps.username)
+            .ok_or_else(|| "unknown user".to_string())?;
+        // Role always comes from live config, but AAD still uses the sealed
+        // role string so tampering with JSON role/expiry/username fails open.
+        let aad = session_aad(&ps.id, &ps.username, &ps.role, ps.expires_unix);
         let blob = B64.decode(&ps.secrets_blob).map_err(|e| e.to_string())?;
-        let kem_dk = crypto::open_with_key(&self.seal_key, &blob).map_err(|e| e.to_string())?;
+        let kem_dk =
+            crypto::open_with_key_aad(&key, &blob, aad.as_bytes()).map_err(|e| e.to_string())?;
         Ok(Session {
             id: ps.id,
             username: ps.username,
-            role: Role::parse(&ps.role),
+            role: Role::parse(&user.role),
             secrets: Arc::new(UserSecrets { kem_dk }),
             expires: unix_to_system(ps.expires_unix),
         })
     }
 
-    fn persist(&self, session: &Session) -> Result<(), String> {
-        if self.seal_key == [0u8; 32] && self.encryption {
-            return Err("session seal key unavailable".into());
+    /// Persist while caller holds the sessions write lock.
+    fn persist_locked(&self, session: &Session) -> Result<(), String> {
+        if !is_valid_session_id(&session.id) {
+            return Err("invalid session id".into());
         }
-        std::fs::create_dir_all(&self.session_dir).map_err(|e| e.to_string())?;
-        let sealed = crypto::seal_with_key(&self.seal_key, &session.secrets.kem_dk)
+        let key = self
+            .seal_key
+            .ok_or_else(|| "login unavailable".to_string())?;
+        crypto::ensure_sessions_dir(&self.session_dir).map_err(|e| e.to_string())?;
+        let expires_unix = system_to_unix(session.expires);
+        let role = session.role.as_str();
+        let aad = session_aad(&session.id, &session.username, role, expires_unix);
+        let sealed = crypto::seal_with_key_aad(&key, &session.secrets.kem_dk, aad.as_bytes())
             .map_err(|e| e.to_string())?;
         let ps = PersistedSession {
             id: session.id.clone(),
             username: session.username.clone(),
-            role: session.role.as_str().to_string(),
-            expires_unix: system_to_unix(session.expires),
+            role: role.to_string(),
+            expires_unix,
             secrets_blob: B64.encode(sealed),
         };
-        let path = self.session_dir.join(format!("{}.json", session.id));
-        let tmp = self.session_dir.join(format!("{}.json.tmp", session.id));
-        let raw = serde_json::to_string_pretty(&ps).map_err(|e| e.to_string())?;
-        std::fs::write(&tmp, raw).map_err(|e| e.to_string())?;
+        let path = self.session_path(&session.id);
+        let tmp = self.session_tmp_path(&session.id);
+        let raw = serde_json::to_string(&ps).map_err(|e| e.to_string())?;
+        crypto::write_private_file(&tmp, raw.as_bytes()).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
@@ -324,12 +446,48 @@ impl AuthState {
         Ok(())
     }
 
-    fn remove_persisted(&self, sid: &str) {
-        let path = self.session_dir.join(format!("{sid}.json"));
-        let _ = std::fs::remove_file(path);
-        let tmp = self.session_dir.join(format!("{sid}.json.tmp"));
-        let _ = std::fs::remove_file(tmp);
+    fn evict_overflow_locked(
+        &self,
+        map: &mut RwLockWriteGuard<'_, HashMap<String, Session>>,
+        username: &str,
+        keep: usize,
+    ) {
+        let mut mine: Vec<(String, SystemTime)> = map
+            .iter()
+            .filter(|(_, s)| s.username == username)
+            .map(|(id, s)| (id.clone(), s.expires))
+            .collect();
+        if mine.len() <= keep {
+            return;
+        }
+        mine.sort_by_key(|(_, exp)| *exp);
+        let drop_n = mine.len() - keep;
+        for (id, _) in mine.into_iter().take(drop_n) {
+            map.remove(&id);
+            self.remove_persisted_path(&self.session_path(&id));
+            self.remove_persisted_path(&self.session_tmp_path(&id));
+        }
     }
+
+    fn session_path(&self, sid: &str) -> PathBuf {
+        self.session_dir.join(format!("{sid}.json"))
+    }
+
+    fn session_tmp_path(&self, sid: &str) -> PathBuf {
+        self.session_dir.join(format!("{sid}.json.tmp"))
+    }
+
+    fn remove_persisted_path(&self, path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn session_aad(id: &str, username: &str, role: &str, expires_unix: u64) -> String {
+    format!("fst-sess-v1|{id}|{username}|{role}|{expires_unix}")
+}
+
+fn is_valid_session_id(id: &str) -> bool {
+    Uuid::parse_str(id).is_ok()
 }
 
 fn system_to_unix(t: SystemTime) -> u64 {
@@ -347,18 +505,17 @@ pub const SESSION_COOKIE: &str = "fst_session";
 
 /// Build Set-Cookie value. Max-Age is intentionally long so the browser keeps
 /// the id; the server enforces the real idle TTL (and persists it across restarts).
-pub fn session_cookie_value(sid: &str, idle_ttl_secs: u64) -> String {
-    // Keep the cookie at least as long as the idle window, and typically much
-    // longer so everyday use never drops the browser cookie while the server
-    // session is still valid via sliding TTL.
+pub fn session_cookie_value(sid: &str, idle_ttl_secs: u64, secure: bool) -> String {
     let max_age = idle_ttl_secs.saturating_mul(8).max(idle_ttl_secs).max(86_400);
+    let secure_flag = if secure { "; Secure" } else { "" };
     format!(
-        "{SESSION_COOKIE}={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}"
+        "{SESSION_COOKIE}={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure_flag}"
     )
 }
 
-pub fn clear_session_cookie() -> String {
-    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0")
+pub fn clear_session_cookie(secure: bool) -> String {
+    let secure_flag = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0{secure_flag}")
 }
 
 #[cfg(test)]
@@ -390,7 +547,11 @@ mod tests {
                     role: "admin".into(),
                 }],
             },
-            session: SessionConfig { ttl_secs: 3600 },
+            session: SessionConfig {
+                ttl_secs: 3600,
+                secure_cookie: false,
+                max_per_user: 8,
+            },
             transfer: TransferConfig::default(),
             media: MediaConfig::default(),
         }
@@ -420,6 +581,94 @@ mod tests {
 
         let auth3 = AuthState::new(&cfg);
         assert!(auth3.get(&sid).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tampered_role_rejected() {
+        let dir = std::env::temp_dir().join(format!("fst-tamper-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = temp_cfg(&dir);
+        cfg.auth.users.push(UserConfig {
+            username: "alice".into(),
+            password_hash: crypto::hash_password("secret").unwrap(),
+            role: "user".into(),
+        });
+        cfg.ensure_dirs().unwrap();
+
+        let auth1 = AuthState::new(&cfg);
+        let sess = auth1.login("alice", "secret").unwrap();
+        let sid = sess.id.clone();
+        drop(auth1);
+
+        // Flip role in plaintext JSON — AAD must invalidate the blob.
+        let path = dir.join("sessions").join(format!("{sid}.json"));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        v["role"] = serde_json::json!("admin");
+        std::fs::write(&path, v.to_string()).unwrap();
+
+        let auth2 = AuthState::new(&cfg);
+        assert!(auth2.get(&sid).is_none(), "tampered role must not restore");
+        assert!(!path.exists(), "bad session file removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logout_not_resurrected_by_stale_persist() {
+        let dir = std::env::temp_dir().join(format!("fst-logout-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = temp_cfg(&dir);
+        cfg.ensure_dirs().unwrap();
+
+        let auth = AuthState::new(&cfg);
+        let sess = auth.login("admin", "secret").unwrap();
+        let sid = sess.id.clone();
+
+        // Simulate: get slides under lock and persists before returning.
+        assert!(auth.get(&sid).is_some());
+        auth.logout(&sid);
+        assert!(auth.get(&sid).is_none());
+        assert!(!dir.join("sessions").join(format!("{sid}.json")).exists());
+
+        // Fresh AuthState must not restore a logged-out session.
+        drop(auth);
+        let auth2 = AuthState::new(&cfg);
+        assert!(auth2.get(&sid).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_path_traversal_session_id() {
+        assert!(!is_valid_session_id("../keystore/evil"));
+        assert!(!is_valid_session_id(""));
+        assert!(is_valid_session_id(&Uuid::new_v4().to_string()));
+    }
+
+    #[test]
+    fn demoted_admin_loses_admin_on_get() {
+        let dir = std::env::temp_dir().join(format!("fst-role-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = temp_cfg(&dir);
+        cfg.ensure_dirs().unwrap();
+
+        let auth = AuthState::new(&cfg);
+        let sess = auth.login("admin", "secret").unwrap();
+        assert_eq!(sess.role, Role::Admin);
+        let sid = sess.id.clone();
+        drop(auth);
+
+        // Demote in config and reload.
+        cfg.auth.users[0].role = "user".into();
+        let auth2 = AuthState::new(&cfg);
+        let s = auth2.get(&sid).unwrap();
+        assert_eq!(s.role, Role::User);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
