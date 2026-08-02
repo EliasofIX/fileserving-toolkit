@@ -187,8 +187,9 @@ impl AuthState {
         let mut map = self.sessions.write();
         // Persist before eviction so a failed write cannot wipe sibling sessions.
         self.persist_locked(&session, &user.password_hash)?;
-        map.insert(id, session.clone());
-        self.evict_overflow_locked(&mut map, username, self.max_per_user);
+        map.insert(id.clone(), session.clone());
+        // Never evict the session we just issued (equal expiries / races).
+        self.evict_overflow_locked(&mut map, username, self.max_per_user, Some(&id));
         Ok(session)
     }
 
@@ -391,7 +392,7 @@ impl AuthState {
                 .into_iter()
                 .collect();
             for u in users {
-                self.evict_overflow_locked(&mut map, &u, self.max_per_user);
+                self.evict_overflow_locked(&mut map, &u, self.max_per_user, None);
             }
             loaded = map.len();
         }
@@ -421,7 +422,15 @@ impl AuthState {
         // Role always comes from live config. AAD binds sealed role + credential
         // fingerprint so JSON tampering or password rotation invalidates the blob.
         let cred = cred_fingerprint(&user.password_hash);
-        let aad = session_aad(&ps.id, &ps.username, &ps.role, ps.expires_unix, &cred);
+        let ks_fp = keystore_fingerprint(&ps.username, &self.keystore);
+        let aad = session_aad(
+            &ps.id,
+            &ps.username,
+            &ps.role,
+            ps.expires_unix,
+            &cred,
+            &ks_fp,
+        );
         let blob = B64.decode(&ps.secrets_blob).map_err(|e| e.to_string())?;
         let kem_dk =
             crypto::open_with_key_aad(&key, &blob, aad.as_bytes()).map_err(|e| e.to_string())?;
@@ -446,12 +455,14 @@ impl AuthState {
         let expires_unix = system_to_unix(session.expires);
         let role = session.role.as_str();
         let cred = cred_fingerprint(password_hash);
+        let ks_fp = keystore_fingerprint(&session.username, &self.keystore);
         let aad = session_aad(
             &session.id,
             &session.username,
             role,
             expires_unix,
             &cred,
+            &ks_fp,
         );
         let sealed = crypto::seal_with_key_aad(&key, &session.secrets.kem_dk, aad.as_bytes())
             .map_err(|e| e.to_string())?;
@@ -480,17 +491,23 @@ impl AuthState {
         map: &mut RwLockWriteGuard<'_, HashMap<String, Session>>,
         username: &str,
         keep: usize,
+        protect: Option<&str>,
     ) {
         let mut mine: Vec<(String, SystemTime)> = map
             .iter()
-            .filter(|(_, s)| s.username == username)
+            .filter(|(id, s)| s.username == username && protect != Some(id.as_str()))
             .map(|(id, s)| (id.clone(), s.expires))
             .collect();
-        if mine.len() <= keep {
+        let protected = protect
+            .filter(|id| map.get(*id).is_some_and(|s| s.username == username))
+            .map(|_| 1usize)
+            .unwrap_or(0);
+        let keep_others = keep.saturating_sub(protected);
+        if mine.len() <= keep_others {
             return;
         }
         mine.sort_by_key(|(_, exp)| *exp);
-        let drop_n = mine.len() - keep;
+        let drop_n = mine.len() - keep_others;
         for (id, _) in mine.into_iter().take(drop_n) {
             map.remove(&id);
             self.remove_persisted_path(&self.session_path(&id));
@@ -517,8 +534,9 @@ fn session_aad(
     role: &str,
     expires_unix: u64,
     cred_fp: &str,
+    keystore_fp: &str,
 ) -> String {
-    format!("fst-sess-v2|{id}|{username}|{role}|{expires_unix}|{cred_fp}")
+    format!("fst-sess-v3|{id}|{username}|{role}|{expires_unix}|{cred_fp}|{keystore_fp}")
 }
 
 /// Short fingerprint of the configured password hash so rotation invalidates sessions.
@@ -526,6 +544,19 @@ fn cred_fingerprint(password_hash: &str) -> String {
     use sha2::{Digest, Sha256};
     let dig = Sha256::digest(password_hash.as_bytes());
     hex::encode(&dig[..16])
+}
+
+/// Fingerprint of the on-disk user keystore so `init-keys` rotation invalidates sessions.
+fn keystore_fingerprint(username: &str, keystore: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let sk = keystore.join(format!("{username}.sk"));
+    match std::fs::read(&sk) {
+        Ok(bytes) => {
+            let dig = Sha256::digest(&bytes);
+            hex::encode(&dig[..16])
+        }
+        Err(_) => "missing".into(),
+    }
 }
 
 fn is_valid_session_id(id: &str) -> bool {
@@ -690,6 +721,49 @@ mod tests {
         assert!(!is_valid_session_id("../keystore/evil"));
         assert!(!is_valid_session_id(""));
         assert!(is_valid_session_id(&Uuid::new_v4().to_string()));
+    }
+
+    #[test]
+    fn login_does_not_evict_just_issued_session() {
+        let dir = std::env::temp_dir().join(format!("fst-evict-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = temp_cfg(&dir);
+        cfg.session.max_per_user = 2;
+        cfg.ensure_dirs().unwrap();
+
+        let auth = AuthState::new(&cfg);
+        let a = auth.login("admin", "secret").unwrap();
+        let b = auth.login("admin", "secret").unwrap();
+        let c = auth.login("admin", "secret").unwrap();
+        assert!(auth.get(&c.id).is_some(), "newest login must remain");
+        let alive = [a.id, b.id, c.id]
+            .iter()
+            .filter(|id| auth.get(id).is_some())
+            .count();
+        assert_eq!(alive, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keystore_rotation_invalidates_sessions() {
+        let dir = std::env::temp_dir().join(format!("fst-ksrot-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = temp_cfg(&dir);
+        cfg.ensure_dirs().unwrap();
+
+        let auth1 = AuthState::new(&cfg);
+        let sess = auth1.login("admin", "secret").unwrap();
+        let sid = sess.id.clone();
+        drop(auth1);
+
+        crypto::create_user_keystore("admin", "secret", &crypto::keystore_dir(&dir)).unwrap();
+        let auth2 = AuthState::new(&cfg);
+        assert!(auth2.get(&sid).is_none(), "init-keys must invalidate sessions");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
