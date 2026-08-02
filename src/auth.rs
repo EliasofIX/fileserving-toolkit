@@ -253,20 +253,32 @@ impl AuthState {
         Some(s)
     }
 
-    /// Check session without sliding TTL or touching disk (for cookie refresh).
+    /// Check session without sliding TTL (for cookie refresh).
+    /// Expired / rotated sessions are purged so they cannot linger in memory.
     pub fn peek(&self, sid: &str) -> Option<Session> {
         if !is_valid_session_id(sid) {
             return None;
         }
-        let map = self.sessions.read();
+        let mut map = self.sessions.write();
         let s = map.get(sid)?.clone();
         if SystemTime::now() > s.expires {
+            map.remove(sid);
+            self.remove_persisted_path(&self.session_path(sid));
+            self.remove_persisted_path(&self.session_tmp_path(sid));
             return None;
         }
-        let user = self.users.iter().find(|u| u.username == s.username)?;
+        let Some(user) = self.users.iter().find(|u| u.username == s.username) else {
+            map.remove(sid);
+            self.remove_persisted_path(&self.session_path(sid));
+            self.remove_persisted_path(&self.session_tmp_path(sid));
+            return None;
+        };
         let live_cred = cred_fingerprint(&user.password_hash);
         let live_ks = keystore_fingerprint(&s.username, &self.keystore);
         if s.cred_fp != live_cred || s.keystore_fp != live_ks {
+            map.remove(sid);
+            self.remove_persisted_path(&self.session_path(sid));
+            self.remove_persisted_path(&self.session_tmp_path(sid));
             return None;
         }
         Some(s)
