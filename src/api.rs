@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/list", get(api_list))
         .route("/api/mkdir", post(api_mkdir))
         .route("/api/delete", delete(api_delete))
+        .route("/api/rename", post(api_rename))
         .route("/api/upload/init", post(api_upload_init))
         .route("/api/upload/{id}", get(api_upload_status).put(api_upload_put))
         .route("/api/upload/{id}/complete", post(api_upload_complete))
@@ -242,6 +243,49 @@ async fn api_delete(
     let path = q.path.unwrap_or_default();
     match st.storage.delete(&path, sess.as_ref()) {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameReq {
+    from: String,
+    to: String,
+}
+
+async fn api_rename(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RenameReq>,
+) -> Response {
+    let sess = match require_auth(&headers, &st.auth) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.storage.rename(&body.from, &body.to, sess.as_ref()) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "from": body.from,
+            "to": body.to,
+        }))
+        .into_response(),
+        Err(e) if e == "destination exists" => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        Err(e) if e == "not found" || e == "forbidden" || e.starts_with("forbidden") => {
+            let code = if e == "not found" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            (code, Json(serde_json::json!({"error": e}))).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
