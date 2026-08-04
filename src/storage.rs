@@ -352,11 +352,26 @@ impl Storage {
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
         for (s, d) in &pending_sidecars {
             if let Err(e) = std::fs::rename(s, d) {
-                let _ = std::fs::rename(&dst, &src);
-                for (ms, md) in moved.iter().rev() {
-                    let _ = std::fs::rename(md, ms);
+                let mut rollback_errs: Vec<String> = Vec::new();
+                if let Err(re) = std::fs::rename(&dst, &src) {
+                    rollback_errs.push(format!("payload {} → {}: {re}", dst.display(), src.display()));
                 }
-                return Err(e.to_string());
+                for (ms, md) in moved.iter().rev() {
+                    if let Err(re) = std::fs::rename(md, ms) {
+                        rollback_errs.push(format!(
+                            "sidecar {} → {}: {re}",
+                            md.display(),
+                            ms.display()
+                        ));
+                    }
+                }
+                if rollback_errs.is_empty() {
+                    return Err(format!("sidecar move failed (rolled back): {e}"));
+                }
+                return Err(format!(
+                    "sidecar move failed: {e}; incomplete rollback (manual repair needed): {}",
+                    rollback_errs.join("; ")
+                ));
             }
             moved.push((s.clone(), d.clone()));
         }
