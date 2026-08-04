@@ -814,8 +814,17 @@ async fn download(
 
         if status == 416 && offset > 0 {
             // Promote only when part length == remote total from Content-Range.
-            let total = content_range_total(res.headers());
+            // If the header is missing (older servers), probe with bytes=0-0.
+            let mut total = content_range_total(res.headers());
             drop(res);
+            if total.is_none() {
+                let probe = [("range", "bytes=0-0".into())];
+                let probe_res = remote
+                    .send(reqwest::Method::GET, &q, &probe, None)
+                    .await?;
+                total = content_range_total(probe_res.headers());
+                drop(probe_res);
+            }
             if total == Some(offset) {
                 std::fs::rename(&part, dest)?;
                 let _ = std::fs::remove_file(&part_meta);
@@ -826,6 +835,13 @@ async fn download(
                 return Ok(());
             }
             // Stale/oversized part — discard and restart once from zero.
+            // If we still don't know the remote size, keep the part and error
+            // rather than deleting a possibly complete download.
+            if total.is_none() {
+                return Err(CliError::Msg(
+                    "get: range not satisfiable and remote size unknown — part kept".into(),
+                ));
+            }
             let _ = std::fs::remove_file(&part);
             let _ = std::fs::remove_file(&part_meta);
             offset = 0;
@@ -891,7 +907,13 @@ pub fn exit_code(err: &CliError) -> i32 {
                 1
             }
         }
-        CliError::Msg(m) if m.contains("URL required") || m.contains("username required") => 2,
+        CliError::Msg(m)
+            if m.contains("URL required")
+                || m.contains("username required")
+                || m.contains("password required") =>
+        {
+            2
+        }
         _ => 1,
     }
 }

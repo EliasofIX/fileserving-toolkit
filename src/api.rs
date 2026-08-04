@@ -600,7 +600,13 @@ fn serve_encrypted(
     let (status, start, end, take) = match parse_range(range, total) {
         Ok(v) => v,
         Err(()) => {
-            return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            res.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{total}")).unwrap(),
+            );
+            return res;
         }
     };
 
