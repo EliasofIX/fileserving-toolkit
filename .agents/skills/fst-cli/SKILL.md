@@ -27,7 +27,7 @@ export FST_USER=agentname                   # when encryption/auth is on
 export FST_PASSWORD='…'                     # when encryption/auth is on
 ```
 
-Or `~/.config/fst/credentials.toml` (mode `600`):
+Or `~/.config/fst/credentials.toml` (mode `600` — CLI refuses group/other-readable files):
 
 ```toml
 url = "https://fst.example"
@@ -38,7 +38,7 @@ password = "…"
 Optional overrides: `--url`, `--user`, `--password`, `--credentials PATH`.
 
 ```bash
-fst login          # cache session in ~/.config/fst/session
+fst login          # cache session in ~/.config/fst/session (mode 600)
 fst whoami
 fst logout
 ```

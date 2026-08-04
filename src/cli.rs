@@ -313,6 +313,7 @@ fn load_credentials(path: &Path) -> Result<Credentials, CliError> {
     if !path.exists() {
         return Ok(Credentials::default());
     }
+    ensure_secret_file_perms(path, "credentials")?;
     let s = std::fs::read_to_string(path)?;
     Ok(toml::from_str(&s)?)
 }
@@ -321,8 +322,27 @@ fn load_session(path: &Path) -> Result<Option<SessionCache>, CliError> {
     if !path.exists() {
         return Ok(None);
     }
+    ensure_secret_file_perms(path, "session")?;
     let s = std::fs::read_to_string(path)?;
     Ok(Some(serde_json::from_str(&s)?))
+}
+
+/// Refuse to load secrets from files that are group/other-readable.
+fn ensure_secret_file_perms(path: &Path, kind: &str) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(CliError::Msg(format!(
+                "{kind} file {} is group/other-readable (mode {:04o}); chmod 600 and retry",
+                path.display(),
+                mode & 0o777
+            )));
+        }
+    }
+    let _ = (path, kind);
+    Ok(())
 }
 
 /// Only reuse a cached session when URL **and** an explicitly configured
@@ -390,9 +410,37 @@ struct DownloadPartMeta {
 fn save_session(path: &Path, cache: &SessionCache) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let s = serde_json::to_string_pretty(cache)?;
-    std::fs::write(path, s)?;
+    // Write via temp + rename, then force 0600 so a loose umask cannot leave
+    // the session world-readable even briefly after the final name appears.
+    let tmp = path.with_extension("session.tmp");
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            use std::io::Write;
+            f.write_all(s.as_bytes())?;
+            f.flush()?;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, &s)?;
+        }
+    }
+    std::fs::rename(&tmp, path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -991,6 +1039,23 @@ mod tests {
             reqwest::header::HeaderValue::from_static("bytes 0-9/42"),
         );
         assert_eq!(content_range_total(&h), Some(42));
+    }
+
+    #[test]
+    fn ensure_secret_file_perms_rejects_world_readable() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("fst-perm-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("credentials.toml");
+            std::fs::write(&path, "url = \"http://x\"\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(ensure_secret_file_perms(&path, "credentials").is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(ensure_secret_file_perms(&path, "credentials").is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

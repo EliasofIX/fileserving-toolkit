@@ -68,7 +68,7 @@ fst whoami
 fst logout
 ```
 
-Or a credentials file (mode `600`):
+Or a credentials file (mode `600` — the CLI refuses to load it if group/other-readable):
 
 ```toml
 # ~/.config/fst/credentials.toml
@@ -77,7 +77,7 @@ username = "claude"
 password = "…"
 ```
 
-Sessions are cached in `~/.config/fst/session` and sent as `Authorization: Bearer`. On `401` the CLI re-logins with the stored password.
+Sessions are cached in `~/.config/fst/session` (also mode `600`) and sent as `Authorization: Bearer`. On `401` the CLI re-logins with the stored password.
 
 `mv` only works within the same space (`shared/…` → `shared/…`, or `~user/…` → `~user/…`). Cross-space moves need `get` + `put` (re-encrypt). Use `--json` for machine-readable output.
 
