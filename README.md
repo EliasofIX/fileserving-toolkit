@@ -1,6 +1,6 @@
 # FST — fileserving-toolkit
 
-Suckless file server: Archive Light web UI, resumable single-stream transfers (TB-scale), optional post-quantum at-rest encryption.
+Suckless file server: Archive Light web UI, resumable single-stream transfers (TB-scale), optional post-quantum at-rest encryption, and a remote CLI for agents and scripts.
 
 ## Quick start (no encryption)
 
@@ -46,6 +46,43 @@ cargo run -- init-keys shared "$FST_SHARED_PASSWORD"
 | `~user/` | Per-user home |
 | Single-admin | Configure one `admin` user only |
 
+## Remote CLI
+
+Agents and scripts use the same accounts as humans. Give the agent a username/password (or write `~/.config/fst/credentials.toml`), then:
+
+```bash
+export FST_URL=https://fst.tailxyz.ts.net
+export FST_USER=claude
+export FST_PASSWORD='…'
+
+fst login
+fst ls
+fst ls shared/
+fst mkdir ~claude/inbox
+fst put ./report.pdf shared/inbox/report.pdf
+fst get shared/inbox/report.pdf ./report.pdf
+fst cat shared/notes.md
+fst mv ~claude/draft.pdf ~claude/inbox/draft.pdf
+fst rm ~claude/tmp/scratch.bin
+fst whoami
+fst logout
+```
+
+Or a credentials file (mode `600` — the CLI refuses to load it if group/other-readable):
+
+```toml
+# ~/.config/fst/credentials.toml
+url = "https://fst.tailxyz.ts.net"
+username = "claude"
+password = "…"
+```
+
+Sessions are cached in `~/.config/fst/session` (also mode `600`) and sent as `Authorization: Bearer`. On `401` the CLI re-logins with the stored password.
+
+`mv` only works within the same space (`shared/…` → `shared/…`, or `~user/…` → `~user/…`). Cross-space moves need `get` + `put` (re-encrypt). Use `--json` for machine-readable output.
+
+Agent how-to: [`.agents/skills/fst-cli/SKILL.md`](.agents/skills/fst-cli/SKILL.md) (Cursor skill — invoke with `/fst-cli` or when the agent needs FST file ops).
+
 ## Transfers
 
 Resumable upload protocol (single stream):
@@ -54,7 +91,7 @@ Resumable upload protocol (single stream):
 2. `PUT /api/upload/:id` with `X-FST-Offset` + body chunk (≤64 MiB)
 3. `POST /api/upload/:id/complete`
 
-Downloads use HTTP `Range`. State survives process restart under `upload_state_dir`.
+Downloads use HTTP `Range`. Rename/move: `POST /api/rename` `{from, to}` (same principal). State survives process restart under `upload_state_dir`.
 
 Large transfers open the **Transfer Dial** UI.
 

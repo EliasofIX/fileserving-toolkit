@@ -4,3 +4,4 @@ config.toml
 *.part
 .DS_Store
 .superpowers/
+.cursor/

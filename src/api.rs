@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/list", get(api_list))
         .route("/api/mkdir", post(api_mkdir))
         .route("/api/delete", delete(api_delete))
+        .route("/api/rename", post(api_rename))
         .route("/api/upload/init", post(api_upload_init))
         .route("/api/upload/{id}", get(api_upload_status).put(api_upload_put))
         .route("/api/upload/{id}/complete", post(api_upload_complete))
@@ -60,11 +61,16 @@ fn session_from(headers: &HeaderMap, auth: &AuthState) -> Option<Session> {
     if !auth.requires_auth() {
         return None;
     }
-    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in cookie.split(';') {
-        let part = part.trim();
-        if let Some(v) = part.strip_prefix(&format!("{SESSION_COOKIE}=")) {
-            return auth.get(v);
+    // Cookie first (web UI), then Bearer (CLI). Must not early-return when the
+    // Cookie header is absent — otherwise Bearer-only clients can never auth.
+    if let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for part in cookie.split(';') {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix(&format!("{SESSION_COOKIE}=")) {
+                if let Some(s) = auth.get(v) {
+                    return Some(s);
+                }
+            }
         }
     }
     if let Some(authz) = headers.get(header::AUTHORIZATION) {
@@ -242,6 +248,49 @@ async fn api_delete(
     let path = q.path.unwrap_or_default();
     match st.storage.delete(&path, sess.as_ref()) {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameReq {
+    from: String,
+    to: String,
+}
+
+async fn api_rename(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RenameReq>,
+) -> Response {
+    let sess = match require_auth(&headers, &st.auth) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.storage.rename(&body.from, &body.to, sess.as_ref()) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "from": body.from,
+            "to": body.to,
+        }))
+        .into_response(),
+        Err(e) if e == "destination exists" => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        Err(e) if e == "not found" || e == "forbidden" || e.starts_with("forbidden") => {
+            let code = if e == "not found" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            (code, Json(serde_json::json!({"error": e}))).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
@@ -556,7 +605,13 @@ fn serve_encrypted(
     let (status, start, end, take) = match parse_range(range, total) {
         Ok(v) => v,
         Err(()) => {
-            return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            res.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{total}")).unwrap(),
+            );
+            return res;
         }
     };
 
@@ -826,5 +881,74 @@ fn serve_asset(path: &str) -> Response {
                 StatusCode::NOT_FOUND.into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthState;
+    use crate::config::Config;
+    use crate::crypto;
+
+    fn enc_cfg(dir: &std::path::Path, user: &str, hash: &str) -> Config {
+        let raw = format!(
+            r#"
+[server]
+bind = "127.0.0.1:0"
+workers = 1
+data_dir = "{0}"
+[paths]
+shared_root = "{0}/shared"
+users_root = "{0}/users"
+upload_state_dir = "{0}/uploads"
+[encryption]
+enabled = true
+[[auth.users]]
+username = "{1}"
+password_hash = "{2}"
+role = "user"
+[session]
+ttl_secs = 3600
+[transfer]
+buffer_size = 1024
+large_threshold = 1024
+upload_ttl_secs = 3600
+max_size = 1048576
+max_concurrent = 4
+max_per_user = 4
+idle_supersede_secs = 300
+[media]
+ffmpeg = ""
+ffprobe = ""
+cache_dir = "{0}/media"
+"#,
+            dir.display(),
+            user,
+            hash
+        );
+        toml::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn bearer_auth_works_without_cookie() {
+        let dir = std::env::temp_dir().join(format!("fst-bearer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hash = crypto::hash_password("secret").unwrap();
+        let cfg = enc_cfg(&dir, "alice", &hash);
+        cfg.ensure_dirs().unwrap();
+        let auth = AuthState::new(&cfg);
+        crypto::create_user_keystore("alice", "secret", auth.keystore_path()).unwrap();
+        let sess = auth.login("alice", "secret").unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", sess.id)).unwrap(),
+        );
+        // No Cookie header — this used to short-circuit before Bearer.
+        let got = session_from(&headers, &auth).expect("bearer session");
+        assert_eq!(got.username, "alice");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

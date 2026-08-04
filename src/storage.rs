@@ -238,6 +238,145 @@ impl Storage {
         }
         Ok(())
     }
+
+    /// Encryption principal for a virtual path: `"shared"` or the username.
+    pub fn principal(virtual_path: &str) -> Result<String, String> {
+        let vp = virtual_path.trim().trim_start_matches('/');
+        if vp.is_empty() || vp == "." {
+            return Err("invalid path".into());
+        }
+        if vp == "shared" || vp.starts_with("shared/") {
+            return Ok("shared".into());
+        }
+        if let Some(rest) = vp.strip_prefix('~') {
+            let user = rest.split('/').next().unwrap_or("");
+            if user.is_empty() || user.contains("..") {
+                return Err("bad user path".into());
+            }
+            return Ok(user.to_string());
+        }
+        Err("path must start with shared/ or ~username/".into())
+    }
+
+    fn is_space_root(virtual_path: &str) -> bool {
+        let vp = virtual_path.trim().trim_start_matches('/');
+        vp == "shared" || (vp.starts_with('~') && !vp.contains('/'))
+    }
+
+    /// Same-principal rename/move. Moves `.fst-meta` / `.fst-idx` with files.
+    /// Cross-space moves (`~user` ↔ `shared`) are rejected — use download+upload.
+    pub fn rename(
+        &self,
+        from: &str,
+        to: &str,
+        session: Option<&Session>,
+    ) -> Result<(), String> {
+        let from_vp = from.trim().trim_start_matches('/');
+        let to_vp = to.trim().trim_start_matches('/');
+        if from_vp.is_empty() || to_vp.is_empty() {
+            return Err("from and to paths required".into());
+        }
+        if Self::is_space_root(from_vp) || Self::is_space_root(to_vp) {
+            return Err("cannot rename space root".into());
+        }
+
+        let from_prin = Self::principal(from_vp)?;
+        let to_prin = Self::principal(to_vp)?;
+        if from_prin != to_prin {
+            return Err("cross-space move requires re-encrypt; use get+put".into());
+        }
+
+        let src = self.resolve(from_vp, session)?;
+        let dst = self.resolve(to_vp, session)?;
+
+        let meta = std::fs::symlink_metadata(&src).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "not found".into()
+            } else {
+                e.to_string()
+            }
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err("symlink denied".into());
+        }
+
+        if src == dst {
+            return Ok(());
+        }
+
+        if dst.exists() {
+            return Err("destination exists".into());
+        }
+
+        // Refuse moving a directory into itself.
+        if meta.is_dir() {
+            let src_c = src.canonicalize().map_err(|e| e.to_string())?;
+            if let Ok(dst_parent) = dst
+                .parent()
+                .ok_or_else(|| "bad destination".to_string())?
+                .canonicalize()
+            {
+                if dst_parent.starts_with(&src_c) {
+                    return Err("cannot move directory into itself".into());
+                }
+            }
+        }
+
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+
+        if meta.is_dir() {
+            std::fs::rename(&src, &dst).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
+        // Move the payload, then sidecars. On sidecar failure, roll back the
+        // payload (and any sidecars already moved) so we never leave an
+        // encrypted blob without its .fst-meta / .fst-idx.
+        let sidecar_exts = [".fst-meta", ".fst-idx"];
+        let mut pending_sidecars: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for ext in sidecar_exts {
+            let s = PathBuf::from(format!("{}{ext}", src.display()));
+            if s.exists() {
+                let d = PathBuf::from(format!("{}{ext}", dst.display()));
+                if d.exists() {
+                    return Err(format!("destination sidecar exists: {}", d.display()));
+                }
+                pending_sidecars.push((s, d));
+            }
+        }
+
+        std::fs::rename(&src, &dst).map_err(|e| e.to_string())?;
+
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for (s, d) in &pending_sidecars {
+            if let Err(e) = std::fs::rename(s, d) {
+                let mut rollback_errs: Vec<String> = Vec::new();
+                if let Err(re) = std::fs::rename(&dst, &src) {
+                    rollback_errs.push(format!("payload {} → {}: {re}", dst.display(), src.display()));
+                }
+                for (ms, md) in moved.iter().rev() {
+                    if let Err(re) = std::fs::rename(md, ms) {
+                        rollback_errs.push(format!(
+                            "sidecar {} → {}: {re}",
+                            md.display(),
+                            ms.display()
+                        ));
+                    }
+                }
+                if rollback_errs.is_empty() {
+                    return Err(format!("sidecar move failed (rolled back): {e}"));
+                }
+                return Err(format!(
+                    "sidecar move failed: {e}; incomplete rollback (manual repair needed): {}",
+                    rollback_errs.join("; ")
+                ));
+            }
+            moved.push((s.clone(), d.clone()));
+        }
+        Ok(())
+    }
 }
 
 fn ensure_canonical_dir(root: &Path) -> Result<PathBuf, String> {
@@ -369,6 +508,85 @@ mod tests {
             std::os::unix::fs::symlink(&outside, &link).unwrap();
             let err = resolve_under_root(&dir, Path::new("escape/x")).unwrap_err();
             assert!(err.contains("symlink"));
+        }
+    }
+
+    #[test]
+    fn principal_shared_and_user() {
+        assert_eq!(Storage::principal("shared/a").unwrap(), "shared");
+        assert_eq!(Storage::principal("shared").unwrap(), "shared");
+        assert_eq!(Storage::principal("~alice/x").unwrap(), "alice");
+        assert_eq!(Storage::principal("~bob").unwrap(), "bob");
+        assert!(Storage::principal("other/x").is_err());
+    }
+
+    #[test]
+    fn rename_same_principal_moves_sidecars() {
+        let st = test_storage();
+        let shared = st.shared.clone();
+        fs::create_dir_all(shared.join("inbox")).unwrap();
+        fs::write(shared.join("inbox/a.txt"), b"hi").unwrap();
+        fs::write(shared.join("inbox/a.txt.fst-meta"), b"meta").unwrap();
+        fs::write(shared.join("inbox/a.txt.fst-idx"), b"idx").unwrap();
+
+        st.rename("shared/inbox/a.txt", "shared/inbox/b.txt", None)
+            .unwrap();
+
+        assert!(!shared.join("inbox/a.txt").exists());
+        assert!(shared.join("inbox/b.txt").exists());
+        assert!(shared.join("inbox/b.txt.fst-meta").exists());
+        assert!(shared.join("inbox/b.txt.fst-idx").exists());
+        assert!(!shared.join("inbox/a.txt.fst-meta").exists());
+    }
+
+    #[test]
+    fn rename_rejects_cross_space() {
+        let st = test_storage();
+        fs::create_dir_all(st.shared.join("x")).unwrap();
+        fs::write(st.shared.join("x/f.txt"), b"x").unwrap();
+        fs::create_dir_all(st.users.join("alice")).unwrap();
+        let err = st
+            .rename("shared/x/f.txt", "~alice/f.txt", None)
+            .unwrap_err();
+        assert!(err.contains("cross-space"));
+    }
+
+    #[test]
+    fn rename_rejects_destination_exists() {
+        let st = test_storage();
+        fs::write(st.shared.join("a.txt"), b"a").unwrap();
+        fs::write(st.shared.join("b.txt"), b"b").unwrap();
+        let err = st
+            .rename("shared/a.txt", "shared/b.txt", None)
+            .unwrap_err();
+        assert_eq!(err, "destination exists");
+    }
+
+    #[test]
+    fn rename_rejects_destination_sidecar_exists() {
+        let st = test_storage();
+        fs::write(st.shared.join("a.txt"), b"a").unwrap();
+        fs::write(st.shared.join("a.txt.fst-meta"), b"meta").unwrap();
+        fs::write(st.shared.join("b.txt.fst-meta"), b"other").unwrap();
+        let err = st
+            .rename("shared/a.txt", "shared/b.txt", None)
+            .unwrap_err();
+        assert!(err.contains("destination sidecar exists"));
+        // Source untouched when rejected before move.
+        assert!(st.shared.join("a.txt").exists());
+        assert!(st.shared.join("a.txt.fst-meta").exists());
+    }
+
+    fn test_storage() -> Storage {
+        let root = tempfile_dir();
+        let shared = root.join("shared");
+        let users = root.join("users");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&users).unwrap();
+        Storage {
+            shared,
+            users,
+            encryption: false,
         }
     }
 

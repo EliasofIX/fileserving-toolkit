@@ -3,6 +3,7 @@
 mod api;
 mod audio_meta;
 mod auth;
+mod cli;
 mod config;
 mod crypto;
 mod media;
@@ -16,6 +17,7 @@ use config::Config;
 use media::Media;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use storage::Storage;
 use transfer::TransferManager;
@@ -24,14 +26,35 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(name = "fst", about = "fileserving-toolkit — serve files, fast and quiet")]
 struct Cli {
-    #[arg(short, long, default_value = "config.toml")]
+    /// Server config (serve / init-keys only)
+    #[arg(short, long, default_value = "config.toml", global = true)]
     config: PathBuf,
+
+    /// Remote server URL (or FST_URL)
+    #[arg(long, global = true, env = "FST_URL")]
+    url: Option<String>,
+
+    /// Remote username (or FST_USER)
+    #[arg(long, global = true, env = "FST_USER")]
+    user: Option<String>,
+
+    /// Remote password (or FST_PASSWORD)
+    #[arg(long, global = true, env = "FST_PASSWORD")]
+    password: Option<String>,
+
+    /// Path to credentials.toml (default: ~/.config/fst/credentials.toml)
+    #[arg(long, global = true)]
+    credentials: Option<PathBuf>,
+
+    /// Machine-readable JSON output for remote commands
+    #[arg(long, global = true, default_value_t = false)]
+    json: bool,
 
     #[command(subcommand)]
     cmd: Option<Commands>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Commands {
     /// Hash a password for config.toml (Argon2id)
     HashPassword { password: String },
@@ -42,9 +65,47 @@ enum Commands {
     },
     /// Run the server (default)
     Serve,
+
+    // —— remote client (agent / human) ——
+    /// Log in and cache a session
+    Login,
+    /// Log out and clear the cached session
+    Logout,
+    /// Show current remote identity
+    Whoami,
+    /// List a directory (empty path = roots)
+    Ls {
+        #[arg(default_value = "")]
+        path: String,
+    },
+    /// Create a directory
+    Mkdir { path: String },
+    /// Delete a file or directory
+    Rm { path: String },
+    /// Rename / move within the same space (shared↔shared or ~user↔~user)
+    Mv { from: String, to: String },
+    /// Upload a local file (resumable)
+    Put { local: PathBuf, remote: String },
+    /// Download a remote file
+    Get {
+        remote: String,
+        local: Option<PathBuf>,
+    },
+    /// Write a remote file to stdout
+    Cat { remote: String },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn remote_opts(cli: &Cli) -> cli::RemoteOpts {
+    cli::RemoteOpts {
+        url: cli.url.clone(),
+        user: cli.user.clone(),
+        password: cli.password.clone(),
+        credentials: cli.credentials.clone(),
+        json: cli.json,
+    }
+}
+
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "fst=info".into()))
         .with_target(false)
@@ -52,41 +113,101 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let cli = Cli::parse();
 
-    match cli.cmd.unwrap_or(Commands::Serve) {
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => ExitCode::from(code),
+    }
+}
+
+fn run(cli: Cli) -> Result<(), u8> {
+    match cli.cmd.clone().unwrap_or(Commands::Serve) {
         Commands::HashPassword { password } => {
-            let h = crypto::hash_password(&password)?;
+            let h = crypto::hash_password(&password).map_err(|e| {
+                eprintln!("error: {e}");
+                1u8
+            })?;
             println!("{h}");
-            return Ok(());
+            Ok(())
         }
         Commands::InitKeys { username, password } => {
-            let cfg = Config::load(&cli.config)?;
-            cfg.ensure_dirs()?;
+            let cfg = Config::load(&cli.config).map_err(|e| {
+                eprintln!("error: {e}");
+                1u8
+            })?;
+            cfg.ensure_dirs().map_err(|e| {
+                eprintln!("error: {e}");
+                1u8
+            })?;
             let dir = crypto::keystore_dir(&cfg.server.data_dir);
-            crypto::create_user_keystore(&username, &password, &dir)?;
+            crypto::create_user_keystore(&username, &password, &dir).map_err(|e| {
+                eprintln!("error: {e}");
+                1u8
+            })?;
             println!("keystore ready for {username} at {}", dir.display());
-            return Ok(());
+            Ok(())
         }
-        Commands::Serve => {}
+        Commands::Serve => {
+            let cfg = Config::load(&cli.config).map_err(|e| {
+                eprintln!(
+                    "failed to load {}: {e}\nCopy config.example.toml → config.toml",
+                    cli.config.display()
+                );
+                1u8
+            })?;
+            let workers = if cfg.server.workers == 0 {
+                2
+            } else {
+                cfg.server.workers
+            };
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    eprintln!("error: {e}");
+                    1u8
+                })?;
+            rt.block_on(serve(cfg, workers)).map_err(|e| {
+                eprintln!("error: {e}");
+                1u8
+            })
+        }
+        cmd => {
+            let opts = remote_opts(&cli);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    eprintln!("error: {e}");
+                    1u8
+                })?;
+            let result = rt.block_on(async {
+                match cmd {
+                    Commands::Login => cli::cmd_login(&opts).await,
+                    Commands::Logout => cli::cmd_logout(&opts).await,
+                    Commands::Whoami => cli::cmd_whoami(&opts).await,
+                    Commands::Ls { path } => {
+                        let p = if path.is_empty() { None } else { Some(path) };
+                        cli::cmd_ls(&opts, p).await
+                    }
+                    Commands::Mkdir { path } => cli::cmd_mkdir(&opts, path).await,
+                    Commands::Rm { path } => cli::cmd_rm(&opts, path).await,
+                    Commands::Mv { from, to } => cli::cmd_mv(&opts, from, to).await,
+                    Commands::Put { local, remote } => cli::cmd_put(&opts, local, remote).await,
+                    Commands::Get { remote, local } => cli::cmd_get(&opts, remote, local).await,
+                    Commands::Cat { remote } => cli::cmd_cat(&opts, remote).await,
+                    _ => unreachable!(),
+                }
+            });
+            match result {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    Err(cli::exit_code(&e) as u8)
+                }
+            }
+        }
     }
-
-    let cfg = Config::load(&cli.config).map_err(|e| {
-        format!(
-            "failed to load {}: {e}\nCopy config.example.toml → config.toml",
-            cli.config.display()
-        )
-    })?;
-
-    let workers = if cfg.server.workers == 0 {
-        2
-    } else {
-        cfg.server.workers
-    };
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .enable_all()
-        .build()?;
-    rt.block_on(serve(cfg, workers))
 }
 
 async fn serve(
