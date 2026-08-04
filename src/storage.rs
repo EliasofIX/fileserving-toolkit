@@ -331,17 +331,34 @@ impl Storage {
             return Ok(());
         }
 
+        // Move the payload, then sidecars. On sidecar failure, roll back the
+        // payload (and any sidecars already moved) so we never leave an
+        // encrypted blob without its .fst-meta / .fst-idx.
+        let sidecar_exts = [".fst-meta", ".fst-idx"];
+        let mut pending_sidecars: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for ext in sidecar_exts {
+            let s = PathBuf::from(format!("{}{ext}", src.display()));
+            if s.exists() {
+                let d = PathBuf::from(format!("{}{ext}", dst.display()));
+                if d.exists() {
+                    return Err(format!("destination sidecar exists: {}", d.display()));
+                }
+                pending_sidecars.push((s, d));
+            }
+        }
+
         std::fs::rename(&src, &dst).map_err(|e| e.to_string())?;
 
-        let meta_src = PathBuf::from(format!("{}.fst-meta", src.display()));
-        let idx_src = PathBuf::from(format!("{}.fst-idx", src.display()));
-        if meta_src.exists() {
-            let meta_dst = PathBuf::from(format!("{}.fst-meta", dst.display()));
-            std::fs::rename(&meta_src, &meta_dst).map_err(|e| e.to_string())?;
-        }
-        if idx_src.exists() {
-            let idx_dst = PathBuf::from(format!("{}.fst-idx", dst.display()));
-            std::fs::rename(&idx_src, &idx_dst).map_err(|e| e.to_string())?;
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for (s, d) in &pending_sidecars {
+            if let Err(e) = std::fs::rename(s, d) {
+                let _ = std::fs::rename(&dst, &src);
+                for (ms, md) in moved.iter().rev() {
+                    let _ = std::fs::rename(md, ms);
+                }
+                return Err(e.to_string());
+            }
+            moved.push((s.clone(), d.clone()));
         }
         Ok(())
     }
@@ -528,6 +545,21 @@ mod tests {
             .rename("shared/a.txt", "shared/b.txt", None)
             .unwrap_err();
         assert_eq!(err, "destination exists");
+    }
+
+    #[test]
+    fn rename_rejects_destination_sidecar_exists() {
+        let st = test_storage();
+        fs::write(st.shared.join("a.txt"), b"a").unwrap();
+        fs::write(st.shared.join("a.txt.fst-meta"), b"meta").unwrap();
+        fs::write(st.shared.join("b.txt.fst-meta"), b"other").unwrap();
+        let err = st
+            .rename("shared/a.txt", "shared/b.txt", None)
+            .unwrap_err();
+        assert!(err.contains("destination sidecar exists"));
+        // Source untouched when rejected before move.
+        assert!(st.shared.join("a.txt").exists());
+        assert!(st.shared.join("a.txt.fst-meta").exists());
     }
 
     fn test_storage() -> Storage {

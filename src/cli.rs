@@ -134,10 +134,9 @@ impl Remote {
 
         let session_path = config_dir().join(SESSION_FILE);
         let cached = load_session(&session_path)?;
-        let session = match &cached {
-            Some(c) if c.url == base => Some(c.session.clone()),
-            _ => None,
-        };
+        let session = cached
+            .as_ref()
+            .and_then(|c| session_token_if_reusable(c, &base, user.as_deref()));
 
         let http = Client::builder()
             .timeout(Duration::from_secs(600))
@@ -225,16 +224,16 @@ impl Remote {
         self.login_with(&user, &password).await
     }
 
-    async fn request(
+    async fn send(
         &mut self,
         method: reqwest::Method,
         path: &str,
         headers: &[(&str, String)],
         body: Option<Vec<u8>>,
-    ) -> Result<(u16, Vec<u8>), CliError> {
+    ) -> Result<reqwest::Response, CliError> {
         self.ensure_session().await?;
 
-        let send_once = |session: Option<&str>, http: &Client, base: &str| {
+        let build = |session: Option<&str>, http: &Client, base: &str| {
             let mut req = http.request(method.clone(), format!("{base}{path}"));
             if let Some(s) = session {
                 req = req.header(AUTHORIZATION, format!("Bearer {s}"));
@@ -248,23 +247,33 @@ impl Remote {
             req
         };
 
-        let res = send_once(self.session.as_deref(), &self.http, &self.base)
+        let res = build(self.session.as_deref(), &self.http, &self.base)
             .send()
             .await?;
-        let status = res.status().as_u16();
-        if status == 401 {
+        if res.status().as_u16() == 401 {
             let user = self.user.clone();
             let password = self.password.clone();
             if let (Some(u), Some(p)) = (user, password) {
                 self.login_with(&u, &p).await?;
-                let res = send_once(self.session.as_deref(), &self.http, &self.base)
+                return Ok(build(self.session.as_deref(), &self.http, &self.base)
                     .send()
-                    .await?;
-                let status = res.status().as_u16();
-                let bytes = res.bytes().await?.to_vec();
-                return Ok((status, bytes));
+                    .await?);
             }
         }
+        Ok(res)
+    }
+
+    /// Buffer a response body. Only for small API JSON / upload-status replies —
+    /// never use this for file downloads.
+    async fn request(
+        &mut self,
+        method: reqwest::Method,
+        path: &str,
+        headers: &[(&str, String)],
+        body: Option<Vec<u8>>,
+    ) -> Result<(u16, Vec<u8>), CliError> {
+        let res = self.send(method, path, headers, body).await?;
+        let status = res.status().as_u16();
         let bytes = res.bytes().await?.to_vec();
         Ok((status, bytes))
     }
@@ -314,6 +323,25 @@ fn load_session(path: &Path) -> Result<Option<SessionCache>, CliError> {
     }
     let s = std::fs::read_to_string(path)?;
     Ok(Some(serde_json::from_str(&s)?))
+}
+
+/// Only reuse a cached session when URL matches and, if a username is
+/// configured, it matches too — otherwise a different `FST_USER` on the same
+/// server would silently act as the previous account.
+fn session_token_if_reusable(
+    cached: &SessionCache,
+    base: &str,
+    configured_user: Option<&str>,
+) -> Option<String> {
+    if cached.url != base {
+        return None;
+    }
+    if let Some(u) = configured_user {
+        if u != cached.username {
+            return None;
+        }
+    }
+    Some(cached.session.clone())
 }
 
 fn save_session(path: &Path, cache: &SessionCache) -> Result<(), CliError> {
@@ -606,21 +634,61 @@ async fn download(
     dest: &Path,
     to_stdout: bool,
 ) -> Result<(), CliError> {
+    use futures::StreamExt;
+
     let mut remote = Remote::open(opts)?;
     let q = format!("/api/file?path={}", urlencoding(remote_path));
 
-    if to_stdout {
-        let (status, bytes) = remote
-            .request(reqwest::Method::GET, &q, &[], None)
-            .await?;
-        if !(200..300).contains(&status) {
-            return Err(CliError::Http {
-                status,
-                body: String::from_utf8_lossy(&bytes).into_owned(),
-            });
+    let mut offset = 0u64;
+    if !to_stdout && dest.exists() {
+        offset = std::fs::metadata(dest)?.len();
+    }
+
+    let headers: Vec<(&str, String)> = if offset > 0 {
+        vec![("range", format!("bytes={offset}-"))]
+    } else {
+        vec![]
+    };
+
+    let res = remote
+        .send(reqwest::Method::GET, &q, &headers, None)
+        .await?;
+    let status = res.status().as_u16();
+
+    if status == 416 {
+        if to_stdout {
+            return Err(CliError::Msg("empty or complete range".into()));
         }
-        let mut out = io::stdout().lock();
-        out.write_all(&bytes)?;
+        if !remote.json {
+            println!("saved {}", dest.display());
+        } else {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "path": remote_path,
+                    "local": dest.display().to_string(),
+                    "bytes": offset,
+                })
+            );
+        }
+        return Ok(());
+    }
+
+    if status != 200 && status != 206 {
+        let body = res.text().await.unwrap_or_default();
+        return Err(CliError::Http { status, body });
+    }
+
+    if to_stdout {
+        let mut out = io::stdout();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| CliError::Msg(e.to_string()))?;
+            out.write_all(&chunk)?;
+            offset += chunk.len() as u64;
+        }
+        out.flush()?;
         return Ok(());
     }
 
@@ -630,62 +698,22 @@ async fn download(
         }
     }
 
-    let mut offset = 0u64;
-    if dest.exists() {
-        offset = std::fs::metadata(dest)?.len();
-    }
-
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dest)?;
 
-    loop {
-        let range_headers: Vec<(&str, String)> = if offset > 0 {
-            vec![("range", format!("bytes={offset}-"))]
-        } else {
-            vec![]
-        };
-        let (status, bytes) = remote
-            .request(reqwest::Method::GET, &q, &range_headers, None)
-            .await?;
-
-        if status == 416 {
-            // Already complete.
-            break;
-        }
-        if status != 200 && status != 206 {
-            return Err(CliError::Http {
-                status,
-                body: String::from_utf8_lossy(&bytes).into_owned(),
-            });
-        }
-        if bytes.is_empty() {
-            break;
-        }
-        file.write_all(&bytes)?;
-        offset += bytes.len() as u64;
-
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| CliError::Msg(e.to_string()))?;
+        file.write_all(&chunk)?;
+        offset += chunk.len() as u64;
         if !remote.json {
             eprint!("\rget {}", format_size(offset));
             let _ = io::stderr().flush();
         }
-
-        // Full body without Range → done in one shot.
-        if status == 200 {
-            break;
-        }
-        // 206 with a short body usually means we got the remainder.
-        if status == 206 && bytes.len() < CHUNK as usize {
-            let probe = [("range", format!("bytes={offset}-{offset}"))];
-            let (st2, _) = remote
-                .request(reqwest::Method::GET, &q, &probe, None)
-                .await?;
-            if st2 == 416 || st2 == 200 || st2 != 206 {
-                break;
-            }
-        }
     }
+    file.flush()?;
 
     if !remote.json {
         eprintln!();
@@ -754,5 +782,31 @@ mod tests {
     fn format_size_basic() {
         assert_eq!(format_size(500), "500 B");
         assert_eq!(format_size(2048), "2.0 KiB");
+    }
+
+    #[test]
+    fn session_reuse_requires_matching_user() {
+        let cached = SessionCache {
+            url: "http://fst".into(),
+            username: "alice".into(),
+            session: "tok-a".into(),
+        };
+        assert_eq!(
+            session_token_if_reusable(&cached, "http://fst", Some("alice")).as_deref(),
+            Some("tok-a")
+        );
+        assert_eq!(
+            session_token_if_reusable(&cached, "http://fst", Some("bob")),
+            None
+        );
+        // No configured user (open-mode / whoami-only) may reuse URL match.
+        assert_eq!(
+            session_token_if_reusable(&cached, "http://fst", None).as_deref(),
+            Some("tok-a")
+        );
+        assert_eq!(
+            session_token_if_reusable(&cached, "http://other", Some("alice")),
+            None
+        );
     }
 }
