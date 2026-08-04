@@ -666,6 +666,77 @@ pub async fn cmd_cat(opts: &RemoteOpts, remote_path: String) -> Result<(), CliEr
     download(opts, &remote_path, Path::new("-"), true).await
 }
 
+fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let cr = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    // Accept "bytes */N" or "bytes A-B/N".
+    let total = cr.rsplit('/').next()?;
+    total.parse().ok()
+}
+
+fn write_part_marker(part_meta: &Path, remote_path: &str, url: &str) -> Result<(), CliError> {
+    let marker = DownloadPartMeta {
+        remote: remote_path.to_string(),
+        url: url.to_string(),
+    };
+    std::fs::write(part_meta, serde_json::to_string_pretty(&marker)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(part_meta, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn finish_get_output(remote: &Remote, remote_path: &str, dest: &Path, bytes: u64) {
+    if remote.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "path": remote_path,
+                "local": dest.display().to_string(),
+                "bytes": bytes,
+            })
+        );
+    } else {
+        println!("saved {}", dest.display());
+    }
+}
+
+async fn stream_to_part(
+    res: reqwest::Response,
+    part: &Path,
+    mut offset: u64,
+    truncate: bool,
+    show_progress: bool,
+) -> Result<u64, CliError> {
+    use futures::StreamExt;
+    let mut file = if truncate {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(part)?
+    } else {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(part)?
+    };
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| CliError::Msg(e.to_string()))?;
+        file.write_all(&chunk)?;
+        offset += chunk.len() as u64;
+        if show_progress {
+            eprint!("\rget {}", format_size(offset));
+            let _ = io::stderr().flush();
+        }
+    }
+    file.flush()?;
+    Ok(offset)
+}
+
 async fn download(
     opts: &RemoteOpts,
     remote_path: &str,
@@ -726,100 +797,67 @@ async fn download(
         let _ = std::fs::remove_file(&part);
         let _ = std::fs::remove_file(&part_meta);
         offset = 0;
-        let marker = DownloadPartMeta {
-            remote: remote_path.to_string(),
-            url: remote.base.clone(),
-        };
-        std::fs::write(&part_meta, serde_json::to_string_pretty(&marker)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&part_meta, std::fs::Permissions::from_mode(0o600));
-        }
+        write_part_marker(&part_meta, remote_path, &remote.base)?;
     }
 
-    let headers: Vec<(&str, String)> = if offset > 0 {
-        vec![("range", format!("bytes={offset}-"))]
-    } else {
-        vec![]
-    };
+    let mut resume_attempted = offset > 0;
+    loop {
+        let headers: Vec<(&str, String)> = if offset > 0 {
+            vec![("range", format!("bytes={offset}-"))]
+        } else {
+            vec![]
+        };
+        let res = remote
+            .send(reqwest::Method::GET, &q, &headers, None)
+            .await?;
+        let status = res.status().as_u16();
 
-    let res = remote
-        .send(reqwest::Method::GET, &q, &headers, None)
-        .await?;
-    let status = res.status().as_u16();
+        if status == 416 && offset > 0 {
+            // Promote only when part length == remote total from Content-Range.
+            let total = content_range_total(res.headers());
+            drop(res);
+            if total == Some(offset) {
+                std::fs::rename(&part, dest)?;
+                let _ = std::fs::remove_file(&part_meta);
+                if !remote.json {
+                    eprintln!();
+                }
+                finish_get_output(&remote, remote_path, dest, offset);
+                return Ok(());
+            }
+            // Stale/oversized part — discard and restart once from zero.
+            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(&part_meta);
+            offset = 0;
+            write_part_marker(&part_meta, remote_path, &remote.base)?;
+            if resume_attempted {
+                resume_attempted = false;
+                continue;
+            }
+            return Err(CliError::Msg(
+                "get: range not satisfiable and could not recover".into(),
+            ));
+        }
 
-    if status == 416 && offset > 0 {
-        // Part already complete — promote to destination.
+        if status != 200 && status != 206 {
+            let body = res.text().await.unwrap_or_default();
+            return Err(CliError::Http { status, body });
+        }
+
+        // 200 = full body (truncate part); 206 = append remainder.
+        let truncate = status == 200;
+        if truncate {
+            offset = 0;
+        }
+        offset = stream_to_part(res, &part, offset, truncate, !remote.json).await?;
         std::fs::rename(&part, dest)?;
         let _ = std::fs::remove_file(&part_meta);
         if !remote.json {
-            println!("saved {}", dest.display());
-        } else {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "ok": true,
-                    "path": remote_path,
-                    "local": dest.display().to_string(),
-                    "bytes": offset,
-                })
-            );
+            eprintln!();
         }
+        finish_get_output(&remote, remote_path, dest, offset);
         return Ok(());
     }
-
-    if status != 200 && status != 206 {
-        let body = res.text().await.unwrap_or_default();
-        return Err(CliError::Http { status, body });
-    }
-
-    // 200 means full body — restart part even if we asked for a range.
-    let mut file = if status == 200 {
-        offset = 0;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&part)?
-    } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&part)?
-    };
-
-    let mut stream = res.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| CliError::Msg(e.to_string()))?;
-        file.write_all(&chunk)?;
-        offset += chunk.len() as u64;
-        if !remote.json {
-            eprint!("\rget {}", format_size(offset));
-            let _ = io::stderr().flush();
-        }
-    }
-    file.flush()?;
-    drop(file);
-
-    std::fs::rename(&part, dest)?;
-    let _ = std::fs::remove_file(&part_meta);
-
-    if !remote.json {
-        eprintln!();
-        println!("saved {}", dest.display());
-    } else {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ok": true,
-                "path": remote_path,
-                "local": dest.display().to_string(),
-                "bytes": offset,
-            })
-        );
-    }
-    Ok(())
 }
 
 fn urlencoding(s: &str) -> String {
@@ -898,6 +936,21 @@ mod tests {
             session_token_if_reusable(&cached, "http://other", Some("alice")),
             None
         );
+    }
+
+    #[test]
+    fn content_range_total_parses() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            reqwest::header::HeaderValue::from_static("bytes */100"),
+        );
+        assert_eq!(content_range_total(&h), Some(100));
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            reqwest::header::HeaderValue::from_static("bytes 0-9/42"),
+        );
+        assert_eq!(content_range_total(&h), Some(42));
     }
 
     #[test]
