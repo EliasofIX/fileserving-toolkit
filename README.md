@@ -81,6 +81,8 @@ Sessions are cached in `~/.config/fst/session` and sent as `Authorization: Beare
 
 `mv` only works within the same space (`shared/…` → `shared/…`, or `~user/…` → `~user/…`). Cross-space moves need `get` + `put` (re-encrypt). Use `--json` for machine-readable output.
 
+Agent how-to: [`.cursor/skills/fst-cli/SKILL.md`](.cursor/skills/fst-cli/SKILL.md) (Cursor skill — invoke with `/fst-cli` or when the agent needs FST file ops).
+
 ## Transfers
 
 Resumable upload protocol (single stream):
