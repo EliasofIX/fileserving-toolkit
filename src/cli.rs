@@ -325,9 +325,10 @@ fn load_session(path: &Path) -> Result<Option<SessionCache>, CliError> {
     Ok(Some(serde_json::from_str(&s)?))
 }
 
-/// Only reuse a cached session when URL matches and, if a username is
-/// configured, it matches too — otherwise a different `FST_USER` on the same
-/// server would silently act as the previous account.
+/// Only reuse a cached session when URL **and** an explicitly configured
+/// username both match. Never reuse a bearer token when `FST_USER` / credentials
+/// username is unset — that would let a later job on a shared host inherit the
+/// previous login.
 fn session_token_if_reusable(
     cached: &SessionCache,
     base: &str,
@@ -336,12 +337,54 @@ fn session_token_if_reusable(
     if cached.url != base {
         return None;
     }
-    if let Some(u) = configured_user {
-        if u != cached.username {
-            return None;
-        }
+    match configured_user {
+        Some(u) if u == cached.username => Some(cached.session.clone()),
+        _ => None,
     }
-    Some(cached.session.clone())
+}
+
+fn reject_symlink(path: &Path, what: &str) -> Result<(), CliError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(CliError::Msg(format!(
+            "{what}: refusing to follow symlink {}",
+            path.display()
+        ))),
+        Ok(_) | Err(_) => Ok(()), // Err(NotFound) is fine for create paths
+    }
+}
+
+fn open_local_file(path: &Path) -> Result<(std::fs::File, u64), CliError> {
+    reject_symlink(path, "put")?;
+    let meta = std::fs::metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(CliError::Msg(format!(
+            "put: refusing to follow symlink {}",
+            path.display()
+        )));
+    }
+    if meta.is_dir() {
+        return Err(CliError::Msg("put: local path is a directory".into()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW — Linux/macOS; rejects symlink races after symlink_metadata.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        return Ok((file, meta.len()));
+    }
+    #[cfg(not(unix))]
+    {
+        Ok((std::fs::File::open(path)?, meta.len()))
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DownloadPartMeta {
+    remote: String,
+    url: String,
 }
 
 fn save_session(path: &Path, cache: &SessionCache) -> Result<(), CliError> {
@@ -521,11 +564,7 @@ pub async fn cmd_mv(opts: &RemoteOpts, from: String, to: String) -> Result<(), C
 
 pub async fn cmd_put(opts: &RemoteOpts, local: PathBuf, remote_path: String) -> Result<(), CliError> {
     let mut remote = Remote::open(opts)?;
-    let meta = std::fs::metadata(&local)?;
-    if meta.is_dir() {
-        return Err(CliError::Msg("put: local path is a directory".into()));
-    }
-    let size = meta.len();
+    let (mut file, size) = open_local_file(&local)?;
 
     let init = remote
         .json_req(
@@ -544,7 +583,6 @@ pub async fn cmd_put(opts: &RemoteOpts, local: PathBuf, remote_path: String) -> 
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
 
-    let mut file = std::fs::File::open(&local)?;
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(offset))?;
 
@@ -639,9 +677,65 @@ async fn download(
     let mut remote = Remote::open(opts)?;
     let q = format!("/api/file?path={}", urlencoding(remote_path));
 
+    if to_stdout {
+        let res = remote.send(reqwest::Method::GET, &q, &[], None).await?;
+        let status = res.status().as_u16();
+        if status != 200 && status != 206 {
+            let body = res.text().await.unwrap_or_default();
+            return Err(CliError::Http { status, body });
+        }
+        let mut out = io::stdout();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| CliError::Msg(e.to_string()))?;
+            out.write_all(&chunk)?;
+        }
+        out.flush()?;
+        return Ok(());
+    }
+
+    // Never append into an existing final destination blindly — resume only a
+    // part file whose marker records this exact remote path + server URL.
+    if dest.exists() {
+        reject_symlink(dest, "get")?;
+    }
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let part = PathBuf::from(format!("{}.fst-part", dest.display()));
+    let part_meta = PathBuf::from(format!("{}.fst-part.json", dest.display()));
+    if part.exists() {
+        reject_symlink(&part, "get")?;
+    }
+
     let mut offset = 0u64;
-    if !to_stdout && dest.exists() {
-        offset = std::fs::metadata(dest)?.len();
+    let can_resume = match std::fs::read_to_string(&part_meta) {
+        Ok(s) => match serde_json::from_str::<DownloadPartMeta>(&s) {
+            Ok(m) if m.remote == remote_path && m.url == remote.base && part.exists() => {
+                offset = std::fs::metadata(&part)?.len();
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if !can_resume {
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&part_meta);
+        offset = 0;
+        let marker = DownloadPartMeta {
+            remote: remote_path.to_string(),
+            url: remote.base.clone(),
+        };
+        std::fs::write(&part_meta, serde_json::to_string_pretty(&marker)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&part_meta, std::fs::Permissions::from_mode(0o600));
+        }
     }
 
     let headers: Vec<(&str, String)> = if offset > 0 {
@@ -655,10 +749,10 @@ async fn download(
         .await?;
     let status = res.status().as_u16();
 
-    if status == 416 {
-        if to_stdout {
-            return Err(CliError::Msg("empty or complete range".into()));
-        }
+    if status == 416 && offset > 0 {
+        // Part already complete — promote to destination.
+        std::fs::rename(&part, dest)?;
+        let _ = std::fs::remove_file(&part_meta);
         if !remote.json {
             println!("saved {}", dest.display());
         } else {
@@ -680,28 +774,20 @@ async fn download(
         return Err(CliError::Http { status, body });
     }
 
-    if to_stdout {
-        let mut out = io::stdout();
-        let mut stream = res.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CliError::Msg(e.to_string()))?;
-            out.write_all(&chunk)?;
-            offset += chunk.len() as u64;
-        }
-        out.flush()?;
-        return Ok(());
-    }
-
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dest)?;
+    // 200 means full body — restart part even if we asked for a range.
+    let mut file = if status == 200 {
+        offset = 0;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&part)?
+    } else {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part)?
+    };
 
     let mut stream = res.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -714,6 +800,10 @@ async fn download(
         }
     }
     file.flush()?;
+    drop(file);
+
+    std::fs::rename(&part, dest)?;
+    let _ = std::fs::remove_file(&part_meta);
 
     if !remote.json {
         eprintln!();
@@ -799,14 +889,30 @@ mod tests {
             session_token_if_reusable(&cached, "http://fst", Some("bob")),
             None
         );
-        // No configured user (open-mode / whoami-only) may reuse URL match.
+        // No configured user → never reuse (shared-host / CI safety).
         assert_eq!(
-            session_token_if_reusable(&cached, "http://fst", None).as_deref(),
-            Some("tok-a")
+            session_token_if_reusable(&cached, "http://fst", None),
+            None
         );
         assert_eq!(
             session_token_if_reusable(&cached, "http://other", Some("alice")),
             None
         );
+    }
+
+    #[test]
+    fn reject_symlink_detects_links() {
+        let dir = std::env::temp_dir().join(format!("fst-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let link = dir.join("link");
+        std::fs::write(&target, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(reject_symlink(&link, "put").is_err());
+            assert!(reject_symlink(&target, "put").is_ok());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -48,6 +48,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 idna = "=1.0.3"  # pin for rustc 1.85 (toolchain)
 clap = { version = "4", features = ["derive", "env"] }
 subtle = "2"
+libc = "0.2"
 lofty = "0.21" # pinned: 0.22+ pulls edition2024 deps
 
 [profile.release]
