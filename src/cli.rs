@@ -687,6 +687,24 @@ fn write_part_marker(part_meta: &Path, remote_path: &str, url: &str) -> Result<(
     Ok(())
 }
 
+fn promote_part(part: &Path, dest: &Path) -> Result<(), CliError> {
+    // Replace an existing destination so rename works on platforms that refuse
+    // to overwrite (and so a refreshed download doesn't leave a stale file).
+    if dest.exists() {
+        reject_symlink(dest, "get")?;
+        let meta = std::fs::symlink_metadata(dest)?;
+        if meta.is_dir() {
+            return Err(CliError::Msg(format!(
+                "get: destination is a directory: {}",
+                dest.display()
+            )));
+        }
+        std::fs::remove_file(dest)?;
+    }
+    std::fs::rename(part, dest)?;
+    Ok(())
+}
+
 fn finish_get_output(remote: &Remote, remote_path: &str, dest: &Path, bytes: u64) {
     if remote.json {
         println!(
@@ -826,7 +844,7 @@ async fn download(
                 drop(probe_res);
             }
             if total == Some(offset) {
-                std::fs::rename(&part, dest)?;
+                promote_part(&part, dest)?;
                 let _ = std::fs::remove_file(&part_meta);
                 if !remote.json {
                     eprintln!();
@@ -866,7 +884,7 @@ async fn download(
             offset = 0;
         }
         offset = stream_to_part(res, &part, offset, truncate, !remote.json).await?;
-        std::fs::rename(&part, dest)?;
+        promote_part(&part, dest)?;
         let _ = std::fs::remove_file(&part_meta);
         if !remote.json {
             eprintln!();

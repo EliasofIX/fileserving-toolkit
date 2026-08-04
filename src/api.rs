@@ -61,11 +61,16 @@ fn session_from(headers: &HeaderMap, auth: &AuthState) -> Option<Session> {
     if !auth.requires_auth() {
         return None;
     }
-    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in cookie.split(';') {
-        let part = part.trim();
-        if let Some(v) = part.strip_prefix(&format!("{SESSION_COOKIE}=")) {
-            return auth.get(v);
+    // Cookie first (web UI), then Bearer (CLI). Must not early-return when the
+    // Cookie header is absent — otherwise Bearer-only clients can never auth.
+    if let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for part in cookie.split(';') {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix(&format!("{SESSION_COOKIE}=")) {
+                if let Some(s) = auth.get(v) {
+                    return Some(s);
+                }
+            }
         }
     }
     if let Some(authz) = headers.get(header::AUTHORIZATION) {
@@ -876,5 +881,74 @@ fn serve_asset(path: &str) -> Response {
                 StatusCode::NOT_FOUND.into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthState;
+    use crate::config::Config;
+    use crate::crypto;
+
+    fn enc_cfg(dir: &std::path::Path, user: &str, hash: &str) -> Config {
+        let raw = format!(
+            r#"
+[server]
+bind = "127.0.0.1:0"
+workers = 1
+data_dir = "{0}"
+[paths]
+shared_root = "{0}/shared"
+users_root = "{0}/users"
+upload_state_dir = "{0}/uploads"
+[encryption]
+enabled = true
+[[auth.users]]
+username = "{1}"
+password_hash = "{2}"
+role = "user"
+[session]
+ttl_secs = 3600
+[transfer]
+buffer_size = 1024
+large_threshold = 1024
+upload_ttl_secs = 3600
+max_size = 1048576
+max_concurrent = 4
+max_per_user = 4
+idle_supersede_secs = 300
+[media]
+ffmpeg = ""
+ffprobe = ""
+cache_dir = "{0}/media"
+"#,
+            dir.display(),
+            user,
+            hash
+        );
+        toml::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn bearer_auth_works_without_cookie() {
+        let dir = std::env::temp_dir().join(format!("fst-bearer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hash = crypto::hash_password("secret").unwrap();
+        let cfg = enc_cfg(&dir, "alice", &hash);
+        cfg.ensure_dirs().unwrap();
+        let auth = AuthState::new(&cfg);
+        crypto::create_user_keystore("alice", "secret", auth.keystore_path()).unwrap();
+        let sess = auth.login("alice", "secret").unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", sess.id)).unwrap(),
+        );
+        // No Cookie header — this used to short-circuit before Bearer.
+        let got = session_from(&headers, &auth).expect("bearer session");
+        assert_eq!(got.username, "alice");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
