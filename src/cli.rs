@@ -835,6 +835,13 @@ async fn download(
     // part file whose marker records this exact remote path + server URL.
     if dest.exists() {
         reject_symlink(dest, "get")?;
+        let meta = std::fs::symlink_metadata(dest)?;
+        if meta.is_dir() {
+            return Err(CliError::Msg(format!(
+                "get: destination is a directory: {}",
+                dest.display()
+            )));
+        }
     }
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
