@@ -43,7 +43,9 @@ fst whoami
 fst logout
 ```
 
-Sessions are sent as `Authorization: Bearer`. On `401`, the CLI re-logins once with the stored password. Open mode (encryption off) needs only `FST_URL`.
+Sessions are sent as `Authorization: Bearer`. On `401`, the CLI re-logins once with the stored password. A cached session is only reused when **both** URL and username match — always set `FST_USER` (or credentials.toml username) in auth mode. Open mode (encryption off) needs only `FST_URL`.
+
+`put` refuses local symlinks (does not follow them). `get` resumes only via a `.fst-part` + `.fst-part.json` marker tied to that remote path — it will not append into an unrelated existing local file.
 
 Never commit passwords, session files, or credentials.toml.
 
