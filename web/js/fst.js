@@ -153,11 +153,17 @@
       b.onclick = () => closeStages();
     });
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") closeStages();
+      if (e.key === "Escape") {
+        if (document.fullscreenElement || document.webkitFullscreenElement) return;
+        closeStages();
+      }
     });
   }
 
   function closeStages() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    }
     ["photo-stage", "video-stage", "music-stage"].forEach((id) => {
       $(`#${id}`).classList.add("hidden");
     });
@@ -165,6 +171,14 @@
     v.pause();
     v.removeAttribute("src");
     v.load();
+    const pv = $("#video-preview-el");
+    if (pv) {
+      pv.pause();
+      pv.removeAttribute("src");
+      pv.load();
+    }
+    const preview = $("#video-preview");
+    if (preview) preview.classList.add("hidden");
     const a = $("#audio-el");
     a.pause();
   }
@@ -375,35 +389,218 @@
   function openVideo(e) {
     closeStages();
     const stage = $("#video-stage");
-    const frame = $(".theater-frame");
+    const frame = $("#theater-frame");
     const video = $("#video-el");
+    const previewVid = $("#video-preview-el");
     const scrub = $("#video-scrub");
+    const preview = $("#video-preview");
+    const previewCanvas = $("#video-preview-canvas");
+    const previewTime = $("#video-preview-time");
+    const timeEl = $("#video-time");
+    const playBtn = $("#video-play");
+    const backBtn = $("#video-back");
+    const fwdBtn = $("#video-fwd");
+    const fsBtn = $("#video-fs");
+    const src = fileUrl(e.path, true);
+    const ctx = previewCanvas.getContext("2d");
+    let scrubbing = false;
+    let previewSeekToken = 0;
+    let previewReady = false;
+
     $("#video-title").textContent = e.name;
-    video.src = fileUrl(e.path, true);
+    timeEl.textContent = "0:00 / 0:00";
+    scrub.value = 0;
+    scrub.style.background = "rgba(255,255,255,0.28)";
+    preview.classList.add("hidden");
+    video.src = src;
+    previewVid.src = src;
     frame.classList.remove("playing");
     stage.classList.remove("hidden");
     stage.focus();
 
-    const playBtn = $("#video-play");
-    const toggle = () => {
-      if (video.paused) {
-        video.play();
-        frame.classList.add("playing");
-      } else {
-        video.pause();
-        frame.classList.remove("playing");
-      }
+    const syncPlaying = () => {
+      frame.classList.toggle("playing", !video.paused);
     };
-    playBtn.onclick = toggle;
+    const paintScrub = (ratio) => {
+      const pct = Math.min(100, Math.max(0, ratio * 100));
+      scrub.style.background = `linear-gradient(to right, #fff ${pct}%, rgba(255,255,255,0.28) ${pct}%)`;
+    };
+    const updateTime = () => {
+      const dur = video.duration;
+      if (!isFinite(dur) || dur <= 0) {
+        timeEl.textContent = `${fmtTime(video.currentTime)} / 0:00`;
+        paintScrub(0);
+        return;
+      }
+      timeEl.textContent = `${fmtTime(video.currentTime)} / ${fmtTime(dur)}`;
+      const ratio = video.currentTime / dur;
+      if (!scrubbing) {
+        scrub.value = Math.floor(ratio * 1000);
+      }
+      paintScrub(scrub.value / 1000);
+    };
+    const seekBy = (delta) => {
+      if (!isFinite(video.duration)) return;
+      video.currentTime = Math.min(
+        Math.max(0, video.currentTime + delta),
+        video.duration
+      );
+      updateTime();
+    };
+    const toggle = () => {
+      if (video.paused) video.play().catch(() => {});
+      else video.pause();
+    };
+    const ratioFromClientX = (clientX) => {
+      const rect = scrub.getBoundingClientRect();
+      if (!rect.width) return 0;
+      return Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    };
+    const drawPreviewFrame = () => {
+      const vw = previewVid.videoWidth;
+      const vh = previewVid.videoHeight;
+      if (!vw || !vh) return;
+      const cw = previewCanvas.width;
+      const ch = previewCanvas.height;
+      const scale = Math.min(cw / vw, ch / vh);
+      const dw = vw * scale;
+      const dh = vh * scale;
+      ctx.fillStyle = "#111";
+      ctx.fillRect(0, 0, cw, ch);
+      ctx.drawImage(previewVid, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+    };
+    const showPreviewAt = (ratio) => {
+      if (!isFinite(video.duration) || video.duration <= 0) return;
+      const t = ratio * video.duration;
+      const scrubW = scrub.clientWidth || 1;
+      const half = Math.min(90, scrubW * 0.12);
+      const px = ratio * scrubW;
+      const clamped = Math.min(scrubW - half, Math.max(half, px));
+      previewTime.textContent = fmtTime(t);
+      preview.style.left = `${clamped}px`;
+      preview.classList.remove("hidden");
+      preview.setAttribute("aria-hidden", "false");
+      const token = ++previewSeekToken;
+      const apply = () => {
+        if (token !== previewSeekToken) return;
+        if (Math.abs(previewVid.currentTime - t) > 0.05) {
+          previewVid.currentTime = t;
+        } else if (previewReady) {
+          drawPreviewFrame();
+        }
+      };
+      if (previewVid.readyState >= 1) apply();
+      else previewVid.addEventListener("loadedmetadata", apply, { once: true });
+    };
+    const hidePreview = () => {
+      if (scrubbing) return;
+      preview.classList.add("hidden");
+      preview.setAttribute("aria-hidden", "true");
+    };
+    const syncFsBtn = () => {
+      const on =
+        document.fullscreenElement === frame ||
+        document.webkitFullscreenElement === frame;
+      frame.classList.toggle("is-fullscreen", on);
+      fsBtn.setAttribute("aria-label", on ? "Exit fullscreen" : "Fullscreen");
+      fsBtn.title = on ? "Exit fullscreen" : "Fullscreen";
+      fsBtn.innerHTML = on
+        ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+        : `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    };
+    const toggleFullscreen = async () => {
+      try {
+        if (document.fullscreenElement === frame) {
+          await document.exitFullscreen();
+        } else if (frame.requestFullscreen) {
+          await frame.requestFullscreen();
+        } else if (frame.webkitRequestFullscreen) {
+          frame.webkitRequestFullscreen();
+        }
+      } catch (_) {}
+      syncFsBtn();
+    };
+
+    playBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      toggle();
+    };
+    backBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      seekBy(-10);
+    };
+    fwdBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      seekBy(10);
+    };
     video.onclick = toggle;
-    video.ontimeupdate = () => {
-      if (!video.duration) return;
-      scrub.value = Math.floor((video.currentTime / video.duration) * 1000);
+    video.onplay = syncPlaying;
+    video.onpause = syncPlaying;
+    video.ontimeupdate = updateTime;
+    video.onloadedmetadata = updateTime;
+    video.onended = () => {
+      frame.classList.remove("playing");
+      updateTime();
+    };
+
+    previewVid.onloadeddata = () => {
+      previewReady = true;
+    };
+    previewVid.onseeked = () => {
+      drawPreviewFrame();
+    };
+
+    scrub.onpointerdown = () => {
+      scrubbing = true;
+      const onDocUp = () => {
+        scrubbing = false;
+        document.removeEventListener("pointerup", onDocUp);
+        document.removeEventListener("pointercancel", onDocUp);
+        hidePreview();
+      };
+      document.addEventListener("pointerup", onDocUp);
+      document.addEventListener("pointercancel", onDocUp);
     };
     scrub.oninput = () => {
       if (!video.duration) return;
-      video.currentTime = (scrub.value / 1000) * video.duration;
+      const ratio = scrub.value / 1000;
+      video.currentTime = ratio * video.duration;
+      showPreviewAt(ratio);
+      updateTime();
     };
+    scrub.onmousemove = (ev) => {
+      if (!video.duration) return;
+      showPreviewAt(ratioFromClientX(ev.clientX));
+    };
+    scrub.onmouseleave = hidePreview;
+
+    fsBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      toggleFullscreen();
+    };
+    document.onfullscreenchange = syncFsBtn;
+
+    stage.onkeydown = (ev) => {
+      if (stage.classList.contains("hidden")) return;
+      const tag = (ev.target && ev.target.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (ev.key === " " || ev.code === "Space") {
+        ev.preventDefault();
+        toggle();
+      } else if (ev.key === "ArrowLeft") {
+        ev.preventDefault();
+        seekBy(-10);
+      } else if (ev.key === "ArrowRight") {
+        ev.preventDefault();
+        seekBy(10);
+      } else if (ev.key === "f" || ev.key === "F") {
+        ev.preventDefault();
+        toggleFullscreen();
+      }
+    };
+
+    syncFsBtn();
+    syncPlaying();
   }
 
   function openMusic(e) {
