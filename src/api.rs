@@ -389,19 +389,29 @@ async fn api_upload_put(
         }
     };
 
-    match st
-        .transfers
-        .write_chunk(&id, offset, &bytes[..], sess.as_ref())
-    {
-        Ok(u) => Json(serde_json::json!({
+    // Disk writes on exfat can take seconds per chunk — never block tokio workers.
+    let transfers = st.transfers.clone();
+    let id_owned = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        transfers.write_chunk(&id_owned, offset, &bytes[..], sess.as_ref())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(u)) => Json(serde_json::json!({
             "id": u.id,
             "offset": u.offset,
             "size": u.size,
         }))
         .into_response(),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("upload worker failed: {e}")})),
         )
             .into_response(),
     }
@@ -416,11 +426,25 @@ async fn api_upload_complete(
         Ok(s) => s,
         Err(r) => return r,
     };
-    match st.transfers.complete(&id, sess.as_ref(), &st.auth) {
-        Ok(path) => Json(serde_json::json!({"ok": true, "path": path})).into_response(),
-        Err(e) => (
+    // PQ seal of multi‑GB files is CPU+disk heavy; run on blocking pool so
+    // /api/status and other requests stay responsive during finalize.
+    let transfers = st.transfers.clone();
+    let auth = st.auth.clone();
+    let id_owned = id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || transfers.complete(&id_owned, sess.as_ref(), &auth))
+            .await;
+
+    match result {
+        Ok(Ok(path)) => Json(serde_json::json!({"ok": true, "path": path})).into_response(),
+        Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("finalize worker failed: {e}")})),
         )
             .into_response(),
     }
